@@ -1,11 +1,18 @@
+import 'dart:io';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
-import '../services/inference_isolate.dart';
+import '../services/live/detection_tracker.dart';
+import '../services/live/live_frame.dart';
+import '../services/live/live_inference_isolate.dart';
 import '../services/model_service.dart';
 import '../models/detection.dart';
 import '../theme/app_theme.dart';
 
+/// Live camera detection. Uses its own pipeline under `services/live/`
+/// (separate from the upload pipeline): camera frame -> [LiveFrame] ->
+/// [LiveInferenceIsolate] -> [DetectionTracker] -> overlay.
 class LiveDetectionScreen extends StatefulWidget {
   const LiveDetectionScreen({super.key});
 
@@ -15,20 +22,28 @@ class LiveDetectionScreen extends StatefulWidget {
 
 class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   CameraController? _cameraController;
-  final InferenceIsolate _inferenceIsolate = InferenceIsolate();
+  CameraDescription? _camera;
+  final LiveInferenceIsolate _inferenceIsolate = LiveInferenceIsolate();
+  final DetectionTracker _tracker = DetectionTracker();
 
+  /// Boxes normalized (0..1) to the upright camera frame.
   List<Detection> _detections = [];
-  List<Detection> _previousDetections = [];
 
   bool _isProcessing = false;
   bool _isDetecting = false;
   bool _isIsolateReady = false;
+  bool _disposed = false;
+  String? _error;
 
   double _fps = 0;
   double _cpu = 12;
 
   DateTime _lastInference = DateTime.now();
+  DateTime? _lastResultAt;
   final Duration _inferenceInterval = const Duration(milliseconds: 120);
+
+  /// Incremented when detection stops so late results are discarded.
+  int _session = 0;
 
   @override
   void initState() {
@@ -49,131 +64,119 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       debugPrint("Live isolate ready");
     } catch (e) {
       debugPrint("Isolate init error: $e");
+      if (mounted) setState(() => _error = "Model failed to load: $e");
     }
   }
 
   @override
   void dispose() {
-    _cameraController?.dispose();
+    _disposed = true;
+    final controller = _cameraController;
+    _cameraController = null;
+    if (controller != null) {
+      if (controller.value.isStreamingImages) {
+        controller.stopImageStream().catchError((_) {});
+      }
+      controller.dispose();
+    }
     _inferenceIsolate.dispose();
     super.dispose();
   }
 
   Future<void> _initializeCamera() async {
-    final cameras = await availableCameras();
-    _cameraController = CameraController(
-      cameras.first,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
-    await _cameraController!.initialize();
-    await _cameraController!.startImageStream(_processFrame);
-    setState(() {});
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        if (mounted) setState(() => _error = "No camera found on this device");
+        return;
+      }
+      _camera = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+
+      final controller = CameraController(
+        _camera!,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        // Android streams YUV planes, iOS streams a single BGRA plane.
+        imageFormatGroup:
+            Platform.isIOS ? ImageFormatGroup.bgra8888 : ImageFormatGroup.yuv420,
+      );
+      await controller.initialize();
+      if (_disposed) {
+        controller.dispose();
+        return;
+      }
+      _cameraController = controller;
+      await controller.startImageStream(_processFrame);
+      if (mounted) setState(() {});
+    } on CameraException catch (e) {
+      debugPrint("Camera error: ${e.code} ${e.description}");
+      if (mounted) {
+        setState(() => _error = e.code == 'CameraAccessDenied'
+            ? "Camera permission denied. Enable it in Settings."
+            : "Camera error: ${e.description ?? e.code}");
+      }
+    } catch (e) {
+      debugPrint("Camera error: $e");
+      if (mounted) setState(() => _error = "Camera error: $e");
+    }
   }
 
-  Future<void> _processFrame(CameraImage image) async {
-    if (!_isDetecting || !_isIsolateReady) return;
+  void _processFrame(CameraImage image) {
+    if (!_isDetecting || !_isIsolateReady || _isProcessing) return;
 
     final now = DateTime.now();
     if (now.difference(_lastInference) < _inferenceInterval) return;
-    if (_isProcessing) return;
+
+    final camera = _camera;
+    if (camera == null) return;
+
+    final frame = LiveFrame.fromCameraImage(
+      image,
+      sensorOrientation: camera.sensorOrientation,
+      mirror: camera.lensDirection == CameraLensDirection.front,
+    );
+    if (frame == null) {
+      debugPrint("Unsupported camera format: ${image.format.group}");
+      return;
+    }
 
     _isProcessing = true;
-    final start = DateTime.now();
+    _lastInference = now;
+    final session = _session;
 
-    try {
-      final planeY = image.planes[0];
-      final planeU = image.planes[1];
-      final planeV = image.planes[2];
-
-      // 🔥 Send lightweight raw bytes to background without blocking UI
-      _inferenceIsolate.runFromCamera(
-        image.width,
-        image.height,
-        planeY.bytes,
-        planeU.bytes,
-        planeV.bytes,
-        planeU.bytesPerRow,
-        planeU.bytesPerPixel!,
-      ).then((detections) {
-        if (mounted && _isDetecting) {
-          final smoothed = _smoothDetections(detections);
-          final end = DateTime.now();
-          final frameTime = end.difference(start).inMilliseconds;
-
-          setState(() {
-            _detections = smoothed;
-            _fps = frameTime > 0 ? 1000 / frameTime : 0;
-          });
+    // 🔥 Heavy work (colour conversion, resize, inference) runs in the
+    // live isolate; the UI thread only hands over the plane buffers.
+    _inferenceIsolate.process(frame).then((result) {
+      if (!mounted || !_isDetecting || session != _session) return;
+      final smoothed = _tracker.update(result.detections);
+      final at = DateTime.now();
+      final last = _lastResultAt;
+      _lastResultAt = at;
+      setState(() {
+        _detections = smoothed;
+        if (last != null) {
+          final instant = 1000 / at.difference(last).inMilliseconds.clamp(1, 100000);
+          _fps = _fps == 0 ? instant : _fps * 0.7 + instant * 0.3;
         }
-        _lastInference = DateTime.now();
-        _isProcessing = false;
-      }).catchError((e) {
-        debugPrint("Detection error: $e");
-        _isProcessing = false;
       });
-
-    } catch (e) {
-      debugPrint("Stream extraction error: $e");
+    }).catchError((e) {
+      debugPrint("Detection error: $e");
+    }).whenComplete(() {
       _isProcessing = false;
-    }
-  }
-
-  List<Detection> _smoothDetections(List<Detection> newDetections) {
-    if (_previousDetections.isEmpty) {
-      _previousDetections = newDetections;
-      return newDetections;
-    }
-
-    List<Detection> smoothed = [];
-    for (int i = 0; i < newDetections.length; i++) {
-      if (i >= _previousDetections.length) {
-        smoothed.add(newDetections[i]);
-        continue;
-      }
-      final oldBox = _previousDetections[i].boundingBox;
-      final newBox = newDetections[i].boundingBox;
-
-      final smoothBox = Rect.fromLTWH(
-        oldBox.left * 0.7 + newBox.left * 0.3,
-        oldBox.top * 0.7 + newBox.top * 0.3,
-        oldBox.width * 0.7 + newBox.width * 0.3,
-        oldBox.height * 0.7 + newBox.height * 0.3,
-      );
-
-      smoothed.add(
-        Detection(
-          label: newDetections[i].label,
-          confidence: newDetections[i].confidence,
-          boundingBox: smoothBox,
-        ),
-      );
-    }
-    _previousDetections = smoothed;
-    return smoothed;
-  }
-
-  // UPDATED: Now scales to the internal camera aspect ratio container rather than the screen
-  Rect _scaleBox(Rect box, double innerWidth, double innerHeight) {
-    const modelSize = 640.0; // Assuming 640x640 YOLO input
-    final scaleX = innerWidth / modelSize;
-    final scaleY = innerHeight / modelSize;
-
-    return Rect.fromLTWH(
-      box.left * scaleX,
-      box.top * scaleY,
-      box.width * scaleX,
-      box.height * scaleY,
-    );
+    });
   }
 
   void _toggleDetection() {
     setState(() {
       _isDetecting = !_isDetecting;
-      if (!_isDetecting) {
-        _detections.clear();
-        _previousDetections.clear();
-      }
+      _session++;
+      _detections = [];
+      _tracker.reset();
+      _lastResultAt = null;
+      _fps = 0;
     });
   }
 
@@ -187,7 +190,19 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       body: Stack(
         children: [
           if (_cameraController != null && _cameraController!.value.isInitialized)
-            _buildCameraFeedWithBBoxes(), // UPDATED: Replaced direct Positioned.fill
+            _buildCameraFeedWithBBoxes(),
+
+          if (_error != null)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(32),
+                child: Text(
+                  _error!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70, fontSize: 16),
+                ),
+              ),
+            ),
 
           _header(),
           _statsPanel(screenSize),
@@ -197,41 +212,36 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
     );
   }
 
-  // NEW METHOD: Handles the native, un-squeezed camera view and aligned bounding boxes
+  /// Camera preview and boxes share one portrait canvas with the preview's
+  /// aspect ratio, scaled to cover the screen, so boxes stay aligned.
   Widget _buildCameraFeedWithBBoxes() {
     final size = MediaQuery.of(context).size;
-    final cameraRatio = _cameraController!.value.aspectRatio;
+    final previewRatio = _cameraController!.value.aspectRatio; // landscape w/h
 
-    // We set an arbitrary base dimension for the inner canvas.
-    // The FittedBox will scale this up perfectly to the actual screen size.
     const double baseDimension = 1000.0;
-    final double innerWidth = baseDimension;
-    final double innerHeight = baseDimension * cameraRatio;
+    const double innerWidth = baseDimension;
+    final double innerHeight = baseDimension * previewRatio;
 
     return SizedBox(
       width: size.width,
       height: size.height,
       child: FittedBox(
-        fit: BoxFit.cover, // Scales up to fill screen, cropping edges without squeezing
+        fit: BoxFit.cover,
         child: SizedBox(
           width: innerWidth,
           height: innerHeight,
           child: Stack(
             children: [
-              // 1. The Camera Feed
               Positioned.fill(
                 child: CameraPreview(_cameraController!),
               ),
-
-              // 2. The Bounding Boxes
               ..._detections.map((det) {
-                // Scale boxes relative to the inner container, NOT the screen
-                final box = _scaleBox(det.boundingBox, innerWidth, innerHeight);
+                final b = det.boundingBox; // normalized to upright frame
                 return Positioned(
-                  left: box.left,
-                  top: box.top,
-                  width: box.width,
-                  height: box.height,
+                  left: b.left * innerWidth,
+                  top: b.top * innerHeight,
+                  width: b.width * innerWidth,
+                  height: b.height * innerHeight,
                   child: _BBox(
                     label: "${det.label} ${(det.confidence * 100).toStringAsFixed(1)}%",
                   ),
