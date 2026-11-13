@@ -148,7 +148,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       return;
     }
 
-    if (kDebugMode && !_loggedFirstFrame) {
+    if (!kReleaseMode && !_loggedFirstFrame) {
       _loggedFirstFrame = true;
       debugPrint(
         "📷 live: first frame ${image.width}x${image.height} "
@@ -167,7 +167,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
         .process(frame)
         .then((result) {
           if (!mounted || !_isDetecting || session != _session) return;
-          if (kDebugMode) {
+          if (!kReleaseMode) {
             debugPrint(
               "📷 live: ${result.detections.length} detections "
               "(${result.inferenceMs}ms)",

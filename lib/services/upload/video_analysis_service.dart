@@ -9,7 +9,7 @@ import '../../models/detection.dart';
 import '../../utils/preprocessing.dart';
 import '../model_service.dart';
 
-/// Events emitted while a video is analysed.
+/// Events emitted while a video is processed.
 sealed class VideoAnalysisEvent {
   const VideoAnalysisEvent();
 }
@@ -45,24 +45,34 @@ class VideoAnalysisError extends VideoAnalysisEvent {
   const VideoAnalysisError(this.message);
 }
 
-/// Analyses an uploaded video in a background isolate (upload pipeline only).
+/// Real-time video detection for the upload pipeline, Python/OpenCV style:
+/// a background loop reads the video frame by frame and detects on frames
+/// as fast as the phone allows, while the screen plays the video.
 ///
-/// Decoding, resizing and inference all run in the worker, so the UI thread
-/// does nothing but play the video. Every result carries the timestamp of the
-/// frame it was computed from; the screen looks boxes up by playback
-/// position, so a box can never be drawn on a later frame than its own.
+/// Two isolates run in parallel:
+/// * **decoder** – `cap.grab()`s every frame (decode only) and `cap.read()`s
+///   the frames picked for detection, resizes them natively and hands them
+///   to the detector. It never runs more than one sample ahead of the
+///   detector, so detection keeps pace with decoding.
+/// * **detector** – runs the model and emits timestamped boxes.
+///
+/// The spacing between detected frames adapts to the measured inference
+/// time (between [minIntervalMs] and [maxIntervalMs] of video time) so
+/// detection keeps up with real-time playback on the phone it runs on.
 class VideoAnalysisService {
-  /// Analyse one frame every [sampleIntervalMs] of video time.
-  final int sampleIntervalMs;
+  final int minIntervalMs;
+  final int maxIntervalMs;
 
-  VideoAnalysisService({this.sampleIntervalMs = 200});
+  VideoAnalysisService({this.minIntervalMs = 200, this.maxIntervalMs = 500});
 
-  Isolate? _isolate;
-  SendPort? _control;
+  Isolate? _decoder;
+  Isolate? _detector;
+  SendPort? _decoderPort;
+  SendPort? _detectorPort;
   ReceivePort? _events;
   StreamController<VideoAnalysisEvent>? _controller;
 
-  bool get isRunning => _isolate != null;
+  bool get isRunning => _events != null;
 
   Stream<VideoAnalysisEvent> start(String videoPath, Uint8List modelBytes) {
     stop();
@@ -71,57 +81,79 @@ class VideoAnalysisService {
     _controller = controller;
     _events = events;
 
+    void fail(Object e) {
+      if (_events != events) return;
+      if (!controller.isClosed) controller.add(VideoAnalysisError('$e'));
+      stop();
+    }
+
     events.listen((msg) {
-      if (msg is SendPort) {
-        _control = msg;
+      if (_events != events) return;
+      if (msg is List && msg.isNotEmpty) {
+        switch (msg[0]) {
+          case 'detector':
+            _detectorPort = msg[1] as SendPort;
+          case 'detector-ready':
+            Isolate.spawn(_decoderEntry, [
+                  events.sendPort,
+                  videoPath,
+                  _detectorPort,
+                  minIntervalMs,
+                  maxIntervalMs,
+                ])
+                .then((iso) {
+                  if (_events == events) {
+                    _decoder = iso;
+                  } else {
+                    iso.kill(priority: Isolate.immediate);
+                  }
+                })
+                .catchError((Object e) {
+                  fail(e);
+                });
+          case 'decoder':
+            _decoderPort = msg[1] as SendPort;
+        }
         return;
       }
       if (msg is VideoAnalysisEvent && !controller.isClosed) {
         controller.add(msg);
-        if (msg is VideoAnalysisDone || msg is VideoAnalysisError) {
-          _cleanup();
-        }
+        if (msg is VideoAnalysisDone || msg is VideoAnalysisError) stop();
       }
     });
 
-    Isolate.spawn(_entry, [
-          events.sendPort,
-          videoPath,
-          modelBytes,
-          sampleIntervalMs,
-        ])
+    Isolate.spawn(_detectorEntry, [events.sendPort, modelBytes])
         .then((iso) {
-          if (_events != events) {
-            iso.kill(priority: Isolate.immediate); // stopped while spawning
+          if (_events == events) {
+            _detector = iso;
           } else {
-            _isolate = iso;
+            iso.kill(priority: Isolate.immediate);
           }
         })
         .catchError((Object e) {
-          if (!controller.isClosed) controller.add(VideoAnalysisError('$e'));
-          _cleanup();
+          fail(e);
         });
 
     return controller.stream;
   }
 
-  /// Stops analysis. The worker releases the decoder and model on its own;
-  /// it is force-killed if it does not exit promptly.
+  /// Stops processing. Workers release the decoder and model themselves and
+  /// are force-killed if they do not exit promptly.
   void stop() {
-    final iso = _isolate;
-    _control?.send('cancel');
-    if (iso != null) {
-      Timer(
-        const Duration(seconds: 2),
-        () => iso.kill(priority: Isolate.immediate),
-      );
+    _decoderPort?.send('cancel');
+    _detectorPort?.send('exit');
+    for (final iso in [_decoder, _detector]) {
+      if (iso != null) {
+        Timer(
+          const Duration(seconds: 2),
+          () => iso.kill(priority: Isolate.immediate),
+        );
+      }
     }
-    _cleanup();
-  }
-
-  void _cleanup() {
-    _isolate = null;
-    _control = null;
+    _decoder = null;
+    _detector = null;
+    _decoderPort = null;
+    _detectorPort = null;
     _events?.close();
     _events = null;
     final c = _controller;
@@ -129,30 +161,130 @@ class VideoAnalysisService {
     if (c != null && !c.isClosed) c.close();
   }
 
-  // ─────────────────────── Worker isolate ───────────────────────
+  // ─────────────────────── Detector isolate ───────────────────────
 
-  static Future<void> _entry(List<dynamic> args) async {
-    final SendPort out = args[0];
+  static Future<void> _detectorEntry(List<dynamic> args) async {
+    final SendPort main = args[0];
+    final Uint8List modelBytes = args[1];
+    final port = ReceivePort();
+    main.send(['detector', port.sendPort]);
+
+    final ModelService model;
+    try {
+      model = ModelService.withSession(
+        await ModelService.createSession(modelBytes),
+      );
+    } catch (e) {
+      main.send(VideoAnalysisError('Model failed to load: $e'));
+      port.close();
+      return;
+    }
+    main.send(['detector-ready']);
+
+    SendPort? decoder;
+    try {
+      await for (final msg in port) {
+        if (msg == 'exit') break;
+        if (msg is! List) continue;
+        if (msg[0] == 'hello') {
+          decoder = msg[1] as SendPort;
+          continue;
+        }
+        // ['job', ts, frameW, frameH, pixels]
+        final int ts = msg[1];
+        final int w = msg[2];
+        final int h = msg[3];
+        final Uint8List pixels = (msg[4] as TransferableTypedData)
+            .materialize()
+            .asUint8List();
+        final sw = Stopwatch()..start();
+        List<Detection> dets = const [];
+        try {
+          final lb = LetterboxInfo.forSize(w, h);
+          final input = tensorFromPacked(
+            pixels,
+            lb.newWidth,
+            lb.newHeight,
+            lb,
+            bgr: true,
+          );
+          dets = _normalize(model.detectTensor(input), lb, w, h);
+        } catch (e) {
+          main.send(VideoAnalysisError('Detection failed: $e'));
+        }
+        final ms = sw.elapsedMilliseconds;
+        if (!kReleaseMode) {
+          debugPrint('🎞️ video ${ts}ms: ${dets.length} detections (${ms}ms)');
+        }
+        main.send(VideoFrameDetections(ts, dets));
+        decoder?.send(['free', ms]);
+      }
+    } finally {
+      model.release();
+      port.close();
+    }
+  }
+
+  static List<Detection> _normalize(
+    List<Detection> dets,
+    LetterboxInfo lb,
+    int w,
+    int h,
+  ) {
+    final result = <Detection>[];
+    for (final d in dets) {
+      final src = lb.toSource(d.boundingBox);
+      final box = Rect.fromLTRB(
+        (src.left / w).clamp(0.0, 1.0),
+        (src.top / h).clamp(0.0, 1.0),
+        (src.right / w).clamp(0.0, 1.0),
+        (src.bottom / h).clamp(0.0, 1.0),
+      );
+      if (box.width <= 0 || box.height <= 0) continue;
+      result.add(
+        Detection(label: d.label, confidence: d.confidence, boundingBox: box),
+      );
+    }
+    return result;
+  }
+
+  // ─────────────────────── Decoder isolate ───────────────────────
+
+  static Future<void> _decoderEntry(List<dynamic> args) async {
+    final SendPort main = args[0];
     final String path = args[1];
-    final Uint8List modelBytes = args[2];
-    final int interval = args[3];
+    final SendPort detector = args[2];
+    final int minInterval = args[3];
+    final int maxInterval = args[4];
 
     final control = ReceivePort();
-    out.send(control.sendPort);
+    main.send(['decoder', control.sendPort]);
+    detector.send(['hello', control.sendPort]);
+
     var cancelled = false;
+    var detectorFree = Completer<void>()..complete();
+    double inferMsEma = minInterval.toDouble();
     control.listen((msg) {
-      if (msg == 'cancel') cancelled = true;
+      if (msg == 'cancel') {
+        cancelled = true;
+        if (!detectorFree.isCompleted) detectorFree.complete();
+      } else if (msg is List && msg[0] == 'free') {
+        inferMsEma = inferMsEma * 0.7 + (msg[1] as int) * 0.3;
+        if (!detectorFree.isCompleted) detectorFree.complete();
+      }
     });
 
     cv.VideoCapture? cap;
-    ModelService? model;
     try {
-      final session = await ModelService.createSession(modelBytes);
-      model = ModelService.withSession(session);
-
-      cap = cv.VideoCapture.fromFile(path);
+      // FFmpeg backend: on Android its timestamps are monotonic; the
+      // hardware backend's are not, which would break frame/box sync.
+      cap = cv.VideoCapture.fromFile(path, apiPreference: cv.CAP_FFMPEG);
       if (!cap.isOpened) {
-        out.send(const VideoAnalysisError('Could not open video'));
+        cap.release();
+        cap = cv.VideoCapture.fromFile(path);
+      }
+      if (!cap.isOpened) {
+        main.send(const VideoAnalysisError('Could not open video'));
         return;
       }
 
@@ -173,100 +305,111 @@ class VideoAnalysisService {
               _ => null,
             };
 
-      int frameIndex = 0;
       int lastTs = -1;
+      int frameIndex = 0;
       int nextSampleMs = 0;
       bool infoSent = false;
+      final wall = Stopwatch()..start();
+      int lastLogFrames = 0;
 
-      while (!cancelled) {
-        final (ok, raw) = cap.read();
-        if (!ok || raw.isEmpty) {
-          raw.dispose();
-          break;
-        }
-
-        // Presentation timestamp of this frame; fall back to index/fps if
-        // the backend does not report a usable one.
-        int ts = cap.get(cv.CAP_PROP_POS_MSEC).round();
+      int timestampAfterDecode() {
+        int ts = cap!.get(cv.CAP_PROP_POS_MSEC).round();
         if (ts <= lastTs) ts = (frameIndex * frameMs).round();
         if (ts <= lastTs) ts = lastTs + 1;
-        lastTs = ts;
-        frameIndex++;
-
-        cv.Mat frame = raw;
-        if (rotateCode != null) {
-          frame = cv.rotate(raw, rotateCode);
-          raw.dispose();
-        }
-
-        if (!infoSent) {
-          infoSent = true;
-          final durationMs = frameCount > 0
-              ? (frameCount * frameMs).round()
-              : 0;
-          out.send(VideoAnalysisInfo(frame.cols, frame.rows, fps, durationMs));
-        }
-
-        if (ts >= nextSampleMs) {
-          nextSampleMs = ts + interval;
-          final sw = Stopwatch()..start();
-          final dets = _detect(model, frame);
-          if (kDebugMode) {
-            debugPrint(
-              '🎞️ video ${ts}ms: ${dets.length} detections '
-              '(${sw.elapsedMilliseconds}ms)',
-            );
-          }
-          out.send(VideoFrameDetections(ts, dets));
-        }
-        frame.dispose();
-
-        // Yield so a 'cancel' message can be received between frames.
-        await Future<void>.delayed(Duration.zero);
+        return ts;
       }
 
-      if (!cancelled) out.send(VideoAnalysisDone(lastTs));
+      while (!cancelled) {
+        final double predictedTs = lastTs < 0 ? 0 : lastTs + frameMs;
+        final bool isSample = predictedTs + frameMs / 2 >= nextSampleMs;
+
+        if (!isSample) {
+          // Decode only (no colour conversion) for frames we do not detect.
+          final before = cap.get(cv.CAP_PROP_POS_FRAMES);
+          cap.grab();
+          if (cap.get(cv.CAP_PROP_POS_FRAMES) <= before) break; // end
+          lastTs = timestampAfterDecode();
+          frameIndex++;
+        } else {
+          // Hand over at most one frame at a time: wait for the detector.
+          await detectorFree.future;
+          if (cancelled) break;
+
+          final (ok, raw) = cap.read();
+          if (!ok || raw.isEmpty) {
+            raw.dispose();
+            break;
+          }
+          lastTs = timestampAfterDecode();
+          frameIndex++;
+
+          cv.Mat frame = raw;
+          if (rotateCode != null) {
+            frame = cv.rotate(raw, rotateCode);
+            raw.dispose();
+          }
+          final int w = frame.cols;
+          final int h = frame.rows;
+
+          if (!infoSent) {
+            infoSent = true;
+            final durationMs = frameCount > 0
+                ? (frameCount * frameMs).round()
+                : 0;
+            main.send(VideoAnalysisInfo(w, h, fps, durationMs));
+            if (!kReleaseMode) {
+              debugPrint(
+                '🎞️ video opened ${w}x$h @ ${fps.toStringAsFixed(1)} '
+                'fps, ${frameCount.round()} frames, '
+                'backend ${cap.getBackendName()}',
+              );
+            }
+          }
+
+          final lb = LetterboxInfo.forSize(w, h);
+          final resized = cv.resize(frame, (
+            lb.newWidth,
+            lb.newHeight,
+          ), interpolation: cv.INTER_AREA);
+          frame.dispose();
+          final pixels = TransferableTypedData.fromList([resized.data]);
+          resized.dispose();
+
+          detectorFree = Completer<void>();
+          detector.send(['job', lastTs, w, h, pixels]);
+
+          // Space detections by what the phone can sustain in real time.
+          final interval = (inferMsEma * 1.15)
+              .clamp(minInterval.toDouble(), maxInterval.toDouble())
+              .round();
+          nextSampleMs = lastTs + interval;
+        }
+
+        if (frameIndex % 8 == 0) {
+          // Let 'cancel' / 'free' messages through.
+          await Future<void>.delayed(Duration.zero);
+        }
+        if (!kReleaseMode && frameIndex - lastLogFrames >= 150) {
+          final secs = wall.elapsedMilliseconds / 1000;
+          debugPrint(
+            '🎞️ decoder: $frameIndex frames, '
+            '${(frameIndex / secs).toStringAsFixed(1)} fps '
+            '(video ${(lastTs / 1000).toStringAsFixed(1)}s in '
+            '${secs.toStringAsFixed(1)}s), '
+            'inference ~${inferMsEma.round()}ms',
+          );
+          lastLogFrames = frameIndex;
+        }
+      }
+
+      // Wait for the last frame's detections before reporting completion.
+      await detectorFree.future;
+      if (!cancelled) main.send(VideoAnalysisDone(lastTs));
     } catch (e) {
-      out.send(VideoAnalysisError('Video analysis failed: $e'));
+      main.send(VideoAnalysisError('Video processing failed: $e'));
     } finally {
       cap?.release();
-      model?.release();
       control.close();
     }
-  }
-
-  static List<Detection> _detect(ModelService model, cv.Mat frame) {
-    final int w = frame.cols;
-    final int h = frame.rows;
-    final lb = LetterboxInfo.forSize(w, h);
-    final resized = cv.resize(frame, (
-      lb.newWidth,
-      lb.newHeight,
-    ), interpolation: cv.INTER_LINEAR);
-    final input = tensorFromPacked(
-      resized.data,
-      lb.newWidth,
-      lb.newHeight,
-      lb,
-      bgr: true,
-    );
-    resized.dispose();
-
-    final dets = model.detectTensor(input);
-    final result = <Detection>[];
-    for (final d in dets) {
-      final src = lb.toSource(d.boundingBox);
-      final box = Rect.fromLTRB(
-        (src.left / w).clamp(0.0, 1.0),
-        (src.top / h).clamp(0.0, 1.0),
-        (src.right / w).clamp(0.0, 1.0),
-        (src.bottom / h).clamp(0.0, 1.0),
-      );
-      if (box.width <= 0 || box.height <= 0) continue;
-      result.add(
-        Detection(label: d.label, confidence: d.confidence, boundingBox: box),
-      );
-    }
-    return result;
   }
 }

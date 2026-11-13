@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
@@ -32,13 +34,32 @@ class ModelService {
     return data.buffer.asUint8List();
   }
 
+  /// CPU threads used for inference on Android.
+  ///
+  /// Measured on a Pixel 9 (YOLO11s, 640x640, one inference):
+  ///   NNAPI via appendDefaultProviders  1439 ms
+  ///   NNAPI fp16                         653 ms
+  ///   CPU, ORT default thread count     1928 ms
+  ///   CPU 2 / 3 / 4 / 5 / 6 / 8 threads  396 / 275 / 213-232 / 422 / 436 / 447 ms
+  ///   XNNPACK, 4 threads                 219 ms
+  /// Four threads match the phone's four performance cores; using the
+  /// efficiency cores as well makes every thread wait for the slowest one.
+  static const int androidInferenceThreads = 4;
+
   /// Creates a session inside the calling isolate (same options everywhere).
   static Future<OrtSession> createSession(Uint8List modelBytes) async {
     final sessionOptions = OrtSessionOptions();
-    // Attempt to enable Mobile GPU/NPU if available
-    try {
-      await sessionOptions.appendDefaultProviders();
-    } catch (_) {}
+    if (Platform.isAndroid) {
+      final cores = Platform.numberOfProcessors;
+      sessionOptions.setIntraOpNumThreads(
+        cores < androidInferenceThreads ? cores : androidInferenceThreads,
+      );
+    } else {
+      // iOS: CoreML via the default providers (not benchmarked yet).
+      try {
+        await sessionOptions.appendDefaultProviders();
+      } catch (_) {}
+    }
     final session = OrtSession.fromBuffer(modelBytes, sessionOptions);
     sessionOptions.release();
     return session;

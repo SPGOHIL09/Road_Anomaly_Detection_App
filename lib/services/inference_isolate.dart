@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 
 import '../models/detection.dart';
+import 'upload/image_file_detector.dart';
 import 'model_service.dart';
 
 /// Background inference for the **upload** pipeline (still images).
@@ -32,6 +33,16 @@ class InferenceIsolate {
     return List<Detection>.from(result);
   }
 
+  /// Decodes and detects [path] entirely inside the isolate (fast path for
+  /// high-resolution photos; nothing large crosses the isolate boundary).
+  Future<ImageDetectionResult> runFile(String path) async {
+    final responsePort = ReceivePort();
+    _sendPort.send(['file', path, responsePort.sendPort]);
+    final result = await responsePort.first;
+    responsePort.close();
+    return result as ImageDetectionResult;
+  }
+
   void dispose() {
     _isolate.kill(priority: Isolate.immediate);
   }
@@ -57,6 +68,14 @@ class InferenceIsolate {
         final SendPort replyPort = message[2];
         final detections = await modelService.detectImage(image);
         replyPort.send(detections);
+      } else if (type == 'file') {
+        final String path = message[1];
+        final SendPort replyPort = message[2];
+        try {
+          replyPort.send(await detectImagePath(modelService, path));
+        } catch (e) {
+          replyPort.send(const ImageDetectionResult(1, 1, []));
+        }
       }
     }
   }

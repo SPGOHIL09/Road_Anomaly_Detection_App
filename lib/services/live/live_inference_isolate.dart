@@ -95,7 +95,7 @@ class LiveInferenceIsolate {
         final pre = preprocessLiveFrame(frame);
         final preMs = sw.elapsedMilliseconds;
         final raw = model.detectTensor(pre.input);
-        if (kDebugMode) {
+        if (!kReleaseMode) {
           debugPrint(
             '📷 live worker: preprocess ${preMs}ms, '
             'model ${sw.elapsedMilliseconds - preMs}ms',

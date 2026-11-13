@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
-import 'package:image/image.dart' as img;
+import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
 
 import 'package:road_anomaly_detector/theme/app_theme.dart';
@@ -35,16 +35,24 @@ class _UploadScreenState extends State<UploadScreen>
   List<Detection> _detections = [];
   final InferenceIsolate _isolate = InferenceIsolate();
   bool _isIsolateReady = false;
-  img.Image? _currentImage;
+  Size? _imageSize;
+  bool _detectingImage = false;
 
   // ───── Video state ─────
-  static const int _sampleIntervalMs = 200;
-  static const int _resumeAheadMs = 1500;
+  /// Detection spacing adapts between these (video time) to the phone's
+  /// inference speed; the track tolerates gaps up to the maximum.
+  static const int _minDetectIntervalMs = 200;
+  static const int _sampleIntervalMs = 500;
+
+  /// Playback starts (or resumes) once detections cover this much video
+  /// ahead of the playhead: the "short delay" before smooth playback.
+  static const int _resumeAheadMs = 500;
 
   Uint8List? _modelBytes;
   VideoPlayerController? _video;
   final VideoAnalysisService _analysis = VideoAnalysisService(
-    sampleIntervalMs: _sampleIntervalMs,
+    minIntervalMs: _minDetectIntervalMs,
+    maxIntervalMs: _sampleIntervalMs,
   );
   StreamSubscription<VideoAnalysisEvent>? _analysisSub;
   VideoDetectionTrack _track = VideoDetectionTrack(
@@ -104,7 +112,8 @@ class _UploadScreenState extends State<UploadScreen>
       _selectedFile = file;
       _hasFile = true;
       _detections.clear();
-      _currentImage = null;
+      _imageSize = null;
+      _detectingImage = false;
     });
 
     if (_isVideo) {
@@ -147,15 +156,23 @@ class _UploadScreenState extends State<UploadScreen>
 
   Future<void> _detectImage() async {
     if (_selectedFile == null) return;
-    final bytes = await _selectedFile!.readAsBytes();
-    final image = img.decodeImage(bytes);
-    if (image == null) return;
-
-    _currentImage = image;
-    final detections = await _isolate.run(image);
+    final file = _selectedFile!;
+    setState(() => _detectingImage = true);
+    final sw = Stopwatch()..start();
+    // Decode + detect both happen in the upload isolate (native OpenCV).
+    final result = await _isolate.runFile(file.path);
+    if (!kReleaseMode) {
+      debugPrint(
+        "🖼️ image ${result.width}x${result.height}: "
+        "${result.detections.length} detections (${sw.elapsedMilliseconds}ms)",
+      );
+    }
+    if (!mounted || _selectedFile != file) return;
 
     setState(() {
-      _detections = detections;
+      _detectingImage = false;
+      _imageSize = Size(result.width.toDouble(), result.height.toDouble());
+      _detections = result.detections;
     });
   }
 
@@ -366,9 +383,9 @@ class _UploadScreenState extends State<UploadScreen>
     double sourceWidth = 1.0;
     double sourceHeight = 1.0;
 
-    if (_currentImage != null) {
-      sourceWidth = _currentImage!.width.toDouble();
-      sourceHeight = _currentImage!.height.toDouble();
+    if (_imageSize != null) {
+      sourceWidth = _imageSize!.width;
+      sourceHeight = _imageSize!.height;
     }
 
     final containerScale =
@@ -544,16 +561,15 @@ class _UploadScreenState extends State<UploadScreen>
       status = _videoError!;
     } else if (_analyzing) {
       status = _waitingForAnalysis
-          ? "Analyzing ahead… ${(progress * 100).toStringAsFixed(0)}%"
-          : "Analyzing… ${(progress * 100).toStringAsFixed(0)}%";
+          ? "Buffering detections… ${(progress * 100).toStringAsFixed(0)}%"
+          : "Detecting in real time… ${(progress * 100).toStringAsFixed(0)}%";
     } else if (_track.complete) {
       status =
-          "Analysis complete · defects in ${_track.framesWithDefects} of ${_track.sampleCount} sampled frames";
+          "Detection complete · defects in ${_track.framesWithDefects} of ${_track.sampleCount} detected frames";
     } else if (_track.sampleCount > 0) {
-      status =
-          "Detection stopped · ${(progress * 100).toStringAsFixed(0)}% analysed";
+      status = "Detection stopped at ${(progress * 100).toStringAsFixed(0)}%";
     } else {
-      status = "Press START DETECTION to analyse this video";
+      status = "Press START DETECTION to detect defects";
     }
 
     return Padding(
@@ -738,7 +754,9 @@ class _UploadScreenState extends State<UploadScreen>
                                     ? (_analyzing
                                           ? "STOP DETECTION"
                                           : "START DETECTION")
-                                    : "DETECT",
+                                    : (_detectingImage
+                                          ? "DETECTING..."
+                                          : "DETECT"),
                               ),
                             ),
                           ),
@@ -750,7 +768,8 @@ class _UploadScreenState extends State<UploadScreen>
                                 _hasFile = false;
                                 _selectedFile = null;
                                 _detections.clear();
-                                _currentImage = null;
+                                _imageSize = null;
+                                _detectingImage = false;
                               });
                             },
                             child: Container(
