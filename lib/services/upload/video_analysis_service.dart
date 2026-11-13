@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:isolate';
-import 'dart:typed_data';
 import 'dart:ui';
 
+import 'package:flutter/foundation.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 import '../../models/detection.dart';
@@ -209,7 +209,15 @@ class VideoAnalysisService {
 
         if (ts >= nextSampleMs) {
           nextSampleMs = ts + interval;
-          out.send(VideoFrameDetections(ts, _detect(model, frame)));
+          final sw = Stopwatch()..start();
+          final dets = _detect(model, frame);
+          if (kDebugMode) {
+            debugPrint(
+              '🎞️ video ${ts}ms: ${dets.length} detections '
+              '(${sw.elapsedMilliseconds}ms)',
+            );
+          }
+          out.send(VideoFrameDetections(ts, dets));
         }
         frame.dispose();
 

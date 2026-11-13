@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:isolate';
-import 'dart:typed_data';
 import 'dart:ui';
+
+import 'package:flutter/foundation.dart';
 
 import '../../models/detection.dart';
 import '../model_service.dart';
@@ -92,7 +93,14 @@ class LiveInferenceIsolate {
       final sw = Stopwatch()..start();
       try {
         final pre = preprocessLiveFrame(frame);
+        final preMs = sw.elapsedMilliseconds;
         final raw = model.detectTensor(pre.input);
+        if (kDebugMode) {
+          debugPrint(
+            '📷 live worker: preprocess ${preMs}ms, '
+            'model ${sw.elapsedMilliseconds - preMs}ms',
+          );
+        }
         final w = pre.uprightWidth.toDouble();
         final h = pre.uprightHeight.toDouble();
 

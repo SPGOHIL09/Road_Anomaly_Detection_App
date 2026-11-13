@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../services/live/detection_tracker.dart';
@@ -33,6 +34,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   bool _isDetecting = false;
   bool _isIsolateReady = false;
   bool _disposed = false;
+  bool _loggedFirstFrame = false;
   String? _error;
 
   double _fps = 0;
@@ -146,6 +148,15 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       return;
     }
 
+    if (kDebugMode && !_loggedFirstFrame) {
+      _loggedFirstFrame = true;
+      debugPrint(
+        "📷 live: first frame ${image.width}x${image.height} "
+        "${image.format.group.name}, planes=${image.planes.length}, "
+        "rotation=${frame.rotation}",
+      );
+    }
+
     _isProcessing = true;
     _lastInference = now;
     final session = _session;
@@ -156,6 +167,12 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
         .process(frame)
         .then((result) {
           if (!mounted || !_isDetecting || session != _session) return;
+          if (kDebugMode) {
+            debugPrint(
+              "📷 live: ${result.detections.length} detections "
+              "(${result.inferenceMs}ms)",
+            );
+          }
           final smoothed = _tracker.update(result.detections);
           final at = DateTime.now();
           final last = _lastResultAt;

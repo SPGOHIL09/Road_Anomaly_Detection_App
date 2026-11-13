@@ -325,7 +325,14 @@ class _UploadScreenState extends State<UploadScreen>
   // ───────── DETECT BUTTON ─────────
 
   Future<void> _detect() async {
-    if (!_isIsolateReady) return;
+    if (!_isIsolateReady) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Model is still loading, try again in a moment"),
+        ),
+      );
+      return;
+    }
 
     if (_isVideo) {
       final c = _video;
