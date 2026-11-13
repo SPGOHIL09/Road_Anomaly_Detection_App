@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:ui';
 
@@ -74,7 +75,16 @@ class VideoAnalysisService {
 
   bool get isRunning => _events != null;
 
-  Stream<VideoAnalysisEvent> start(String videoPath, Uint8List modelBytes) {
+  /// [expectPortrait] is the orientation the player shows (from
+  /// `VideoPlayerController.value.size`); decoded frames are rotated to
+  /// match it so boxes line up. [preferHardware] decodes with Android's
+  /// MediaCodec instead of FFmpeg in software.
+  Stream<VideoAnalysisEvent> start(
+    String videoPath,
+    Uint8List modelBytes, {
+    bool? expectPortrait,
+    bool preferHardware = false,
+  }) {
     stop();
     final controller = StreamController<VideoAnalysisEvent>();
     final events = ReceivePort();
@@ -100,6 +110,8 @@ class VideoAnalysisService {
                   _detectorPort,
                   minIntervalMs,
                   maxIntervalMs,
+                  expectPortrait,
+                  preferHardware,
                 ])
                 .then((iso) {
                   if (_events == events) {
@@ -256,6 +268,8 @@ class VideoAnalysisService {
     final SendPort detector = args[2];
     final int minInterval = args[3];
     final int maxInterval = args[4];
+    final bool? expectPortrait = args[5];
+    final bool preferHardware = args[6];
 
     final control = ReceivePort();
     main.send(['decoder', control.sendPort]);
@@ -276,17 +290,28 @@ class VideoAnalysisService {
 
     cv.VideoCapture? cap;
     try {
-      // FFmpeg backend: on Android its timestamps are monotonic; the
-      // hardware backend's are not, which would break frame/box sync.
-      cap = cv.VideoCapture.fromFile(path, apiPreference: cv.CAP_FFMPEG);
-      if (!cap.isOpened) {
-        cap.release();
-        cap = cv.VideoCapture.fromFile(path);
+      // Optional hardware (MediaCodec) backend. Measured on a Pixel 9 with
+      // 4K portrait clips it was no faster than FFmpeg (both ~0.5x real
+      // time while the model runs) and its timestamps are not monotonic,
+      // so FFmpeg is the default.
+      bool hardware = false;
+      if (preferHardware && Platform.isAndroid) {
+        cap = cv.VideoCapture.fromFile(path, apiPreference: cv.CAP_ANDROID);
+        hardware = cap.isOpened;
+        if (!hardware) cap.release();
       }
-      if (!cap.isOpened) {
+      if (!hardware) {
+        cap = cv.VideoCapture.fromFile(path, apiPreference: cv.CAP_FFMPEG);
+        if (!cap.isOpened) {
+          cap.release();
+          cap = cv.VideoCapture.fromFile(path);
+        }
+      }
+      if (cap == null || !cap.isOpened) {
         main.send(const VideoAnalysisError('Could not open video'));
         return;
       }
+      final bool ffmpeg = cap.getBackendName().toUpperCase().contains('FFMPEG');
 
       final double fps = cap.get(cv.CAP_PROP_FPS);
       final double frameMs = fps > 0 ? 1000.0 / fps : 1000.0 / 30.0;
@@ -296,7 +321,7 @@ class VideoAnalysisService {
       // did not, rotate ourselves so frames match what the player shows.
       final int meta = cap.get(cv.CAP_PROP_ORIENTATION_META).round() % 360;
       final bool auto = cap.get(cv.CAP_PROP_ORIENTATION_AUTO) != 0;
-      final int? rotateCode = auto
+      int? rotateCode = auto
           ? null
           : switch (meta) {
               90 => cv.ROTATE_90_CLOCKWISE,
@@ -313,7 +338,11 @@ class VideoAnalysisService {
       int lastLogFrames = 0;
 
       int timestampAfterDecode() {
-        int ts = cap!.get(cv.CAP_PROP_POS_MSEC).round();
+        // The hardware backend's POS_MSEC is not monotonic, so use the frame
+        // index there (phone recordings are constant frame rate).
+        int ts = ffmpeg
+            ? cap!.get(cv.CAP_PROP_POS_MSEC).round()
+            : (frameIndex * frameMs).round();
         if (ts <= lastTs) ts = (frameIndex * frameMs).round();
         if (ts <= lastTs) ts = lastTs + 1;
         return ts;
@@ -325,9 +354,14 @@ class VideoAnalysisService {
 
         if (!isSample) {
           // Decode only (no colour conversion) for frames we do not detect.
-          final before = cap.get(cv.CAP_PROP_POS_FRAMES);
-          cap.grab();
-          if (cap.get(cv.CAP_PROP_POS_FRAMES) <= before) break; // end
+          if (ffmpeg) {
+            final before = cap.get(cv.CAP_PROP_POS_FRAMES);
+            cap.grab();
+            if (cap.get(cv.CAP_PROP_POS_FRAMES) <= before) break; // end
+          } else {
+            if (frameCount > 0 && frameIndex >= frameCount) break; // end
+            cap.grab();
+          }
           lastTs = timestampAfterDecode();
           frameIndex++;
         } else {
@@ -343,6 +377,16 @@ class VideoAnalysisService {
           lastTs = timestampAfterDecode();
           frameIndex++;
 
+          if (!infoSent && expectPortrait != null) {
+            // Match what the player shows, whatever the backend did with
+            // the container's rotation tag.
+            final rawPortrait = raw.rows > raw.cols;
+            rotateCode = rawPortrait == expectPortrait
+                ? (rotateCode == cv.ROTATE_180 ? cv.ROTATE_180 : null)
+                : (meta == 270
+                      ? cv.ROTATE_90_COUNTERCLOCKWISE
+                      : cv.ROTATE_90_CLOCKWISE);
+          }
           cv.Mat frame = raw;
           if (rotateCode != null) {
             frame = cv.rotate(raw, rotateCode);
@@ -361,7 +405,7 @@ class VideoAnalysisService {
               debugPrint(
                 '🎞️ video opened ${w}x$h @ ${fps.toStringAsFixed(1)} '
                 'fps, ${frameCount.round()} frames, '
-                'backend ${cap.getBackendName()}',
+                'backend ${cap.getBackendName()}, rotate $rotateCode',
               );
             }
           }

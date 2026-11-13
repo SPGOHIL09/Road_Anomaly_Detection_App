@@ -188,26 +188,35 @@ class _UploadScreenState extends State<UploadScreen>
     _videoError = null;
     setState(() => _analyzing = true);
 
-    _analysisSub = _analysis.start(file.path, bytes).listen((event) {
-      if (!mounted) return;
-      switch (event) {
-        case VideoAnalysisInfo():
-          _checkOrientation(event);
-        case VideoFrameDetections():
-          _track.add(event.timestampMs, event.detections);
-          // Repaint the progress bar a few times per second, not per sample.
-          if (_track.sampleCount % 5 == 0) setState(() {});
-        case VideoAnalysisDone():
-          _track.complete = true;
-          setState(() => _analyzing = false);
-          _maybeResume();
-        case VideoAnalysisError():
-          setState(() {
-            _analyzing = false;
-            _videoError = event.message;
-          });
-      }
-    });
+    final shown = _video?.value.size;
+    _analysisSub = _analysis
+        .start(
+          file.path,
+          bytes,
+          expectPortrait: shown == null || shown.isEmpty
+              ? null
+              : shown.height > shown.width,
+        )
+        .listen((event) {
+          if (!mounted) return;
+          switch (event) {
+            case VideoAnalysisInfo():
+              _checkOrientation(event);
+            case VideoFrameDetections():
+              _track.add(event.timestampMs, event.detections);
+              // Repaint the progress bar a few times per second, not per sample.
+              if (_track.sampleCount % 5 == 0) setState(() {});
+            case VideoAnalysisDone():
+              _track.complete = true;
+              setState(() => _analyzing = false);
+              _maybeResume();
+            case VideoAnalysisError():
+              setState(() {
+                _analyzing = false;
+                _videoError = event.message;
+              });
+          }
+        });
   }
 
   void _stopAnalysis() {

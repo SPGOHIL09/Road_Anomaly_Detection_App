@@ -7,8 +7,9 @@ import '../../models/detection.dart';
 import '../../utils/preprocessing.dart';
 import '../model_service.dart';
 
-/// Detections for a photo, with boxes in the photo's pixel coordinates
-/// (as displayed, i.e. after EXIF rotation).
+/// Detections for a photo. Boxes are in the pixel space of [width] x
+/// [height] (the decoded, EXIF-rotated image, possibly decoded at reduced
+/// size); the UI scales that space onto the displayed photo.
 class ImageDetectionResult {
   final int width;
   final int height;
@@ -33,7 +34,14 @@ Future<ImageDetectionResult> detectImagePath(
 }
 
 ImageDetectionResult? _detectWithOpenCV(ModelService model, String path) {
-  final cv.Mat mat = cv.imread(path);
+  // JPEG can decode straight to 1/4 size (12 MP -> ~1020x768 in ~40 ms
+  // instead of ~115 ms); that is still larger than the 640 model input.
+  cv.Mat mat = cv.imread(path, flags: cv.IMREAD_REDUCED_COLOR_4);
+  if (mat.isEmpty ||
+      (mat.cols > mat.rows ? mat.cols : mat.rows) < kModelInputSize) {
+    mat.dispose();
+    mat = cv.imread(path);
+  }
   try {
     if (mat.isEmpty) return null;
     final int w = mat.cols;
