@@ -16,10 +16,10 @@ class InferenceIsolate {
   Future<void> start(Uint8List modelBytes) async {
     final receivePort = ReceivePort();
 
-    _isolate = await Isolate.spawn(
-      _isolateEntry,
-      [receivePort.sendPort, modelBytes],
-    );
+    _isolate = await Isolate.spawn(_isolateEntry, [
+      receivePort.sendPort,
+      modelBytes,
+    ]);
 
     _sendPort = await receivePort.first as SendPort;
   }

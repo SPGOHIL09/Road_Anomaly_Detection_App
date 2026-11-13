@@ -15,12 +15,17 @@ import '../utils/nms.dart';
 /// Pipelines (image upload, video upload, live camera) each own their own
 /// isolate and preprocessing; they all call into this class for inference.
 class ModelService {
-
   OrtSession? _session;
 
   ModelService();
 
   ModelService.withSession(this._session);
+
+  /// Frees the native session (call when a worker isolate is done).
+  void release() {
+    _session?.release();
+    _session = null;
+  }
 
   // ───────── Load Model Bytes ─────────
 
@@ -82,7 +87,6 @@ class ModelService {
   // ───────── Run Inference ─────────
 
   Float32List _runInference(List<double> input) {
-
     if (_session == null) {
       throw Exception("ONNX session not initialized");
     }
@@ -94,10 +98,7 @@ class ModelService {
 
     final runOptions = OrtRunOptions();
 
-    final outputs = _session!.run(
-      runOptions,
-      {'images': inputTensor},
-    );
+    final outputs = _session!.run(runOptions, {'images': inputTensor});
 
     inputTensor.release();
     runOptions.release();
@@ -120,10 +121,10 @@ class ModelService {
   ///
   /// Returned boxes are in model-input (letterboxed 640x640) coordinates.
   List<Detection> detectTensor(
-      List<double> input, {
-        double confidenceThreshold = 0.3,
-        double iouThreshold = 0.3,
-      }) {
+    List<double> input, {
+    double confidenceThreshold = 0.3,
+    double iouThreshold = 0.3,
+  }) {
     final rawOutput = _runInference(input);
     final decoded = decodeYOLO(rawOutput, confidenceThreshold);
     return nonMaxSupression(decoded, iouThreshold);
@@ -132,13 +133,12 @@ class ModelService {
   // ───────── Detection (image upload) ─────────
 
   Future<List<Detection>> detectImage(
-      img.Image image, {
-        double confidenceThreshold = 0.3,  // Lowered from 0.1 to catch more defects
-        double iouThreshold = 0.3,  // Lowered from 0.5 to be less aggressive with NMS
-      }) async {
-
+    img.Image image, {
+    double confidenceThreshold = 0.3, // Lowered from 0.1 to catch more defects
+    double iouThreshold =
+        0.3, // Lowered from 0.5 to be less aggressive with NMS
+  }) async {
     try {
-
       // 🔥 Preprocess with metadata
       final result = preprocess(image);
 
@@ -147,11 +147,12 @@ class ModelService {
         confidenceThreshold: confidenceThreshold,
         iouThreshold: iouThreshold,
       );
-      debugPrint("🔍 After NMS: ${filtered.length} detections (IOU threshold: $iouThreshold)");
+      debugPrint(
+        "🔍 After NMS: ${filtered.length} detections (IOU threshold: $iouThreshold)",
+      );
 
       // 🔥 FIX: Reverse letterbox mapping
       final corrected = filtered.map((det) {
-
         final box = det.boundingBox;
 
         final x = (box.left - result.xOffset) / result.scale;
@@ -167,7 +168,6 @@ class ModelService {
       }).toList();
 
       return corrected;
-
     } catch (e) {
       debugPrint("Detection error: $e");
       return [];

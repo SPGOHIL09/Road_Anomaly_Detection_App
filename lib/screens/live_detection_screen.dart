@@ -100,8 +100,9 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
         ResolutionPreset.medium,
         enableAudio: false,
         // Android streams YUV planes, iOS streams a single BGRA plane.
-        imageFormatGroup:
-            Platform.isIOS ? ImageFormatGroup.bgra8888 : ImageFormatGroup.yuv420,
+        imageFormatGroup: Platform.isIOS
+            ? ImageFormatGroup.bgra8888
+            : ImageFormatGroup.yuv420,
       );
       await controller.initialize();
       if (_disposed) {
@@ -114,9 +115,11 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
     } on CameraException catch (e) {
       debugPrint("Camera error: ${e.code} ${e.description}");
       if (mounted) {
-        setState(() => _error = e.code == 'CameraAccessDenied'
-            ? "Camera permission denied. Enable it in Settings."
-            : "Camera error: ${e.description ?? e.code}");
+        setState(
+          () => _error = e.code == 'CameraAccessDenied'
+              ? "Camera permission denied. Enable it in Settings."
+              : "Camera error: ${e.description ?? e.code}",
+        );
       }
     } catch (e) {
       debugPrint("Camera error: $e");
@@ -149,24 +152,29 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
 
     // 🔥 Heavy work (colour conversion, resize, inference) runs in the
     // live isolate; the UI thread only hands over the plane buffers.
-    _inferenceIsolate.process(frame).then((result) {
-      if (!mounted || !_isDetecting || session != _session) return;
-      final smoothed = _tracker.update(result.detections);
-      final at = DateTime.now();
-      final last = _lastResultAt;
-      _lastResultAt = at;
-      setState(() {
-        _detections = smoothed;
-        if (last != null) {
-          final instant = 1000 / at.difference(last).inMilliseconds.clamp(1, 100000);
-          _fps = _fps == 0 ? instant : _fps * 0.7 + instant * 0.3;
-        }
-      });
-    }).catchError((e) {
-      debugPrint("Detection error: $e");
-    }).whenComplete(() {
-      _isProcessing = false;
-    });
+    _inferenceIsolate
+        .process(frame)
+        .then((result) {
+          if (!mounted || !_isDetecting || session != _session) return;
+          final smoothed = _tracker.update(result.detections);
+          final at = DateTime.now();
+          final last = _lastResultAt;
+          _lastResultAt = at;
+          setState(() {
+            _detections = smoothed;
+            if (last != null) {
+              final instant =
+                  1000 / at.difference(last).inMilliseconds.clamp(1, 100000);
+              _fps = _fps == 0 ? instant : _fps * 0.7 + instant * 0.3;
+            }
+          });
+        })
+        .catchError((e) {
+          debugPrint("Detection error: $e");
+        })
+        .whenComplete(() {
+          _isProcessing = false;
+        });
   }
 
   void _toggleDetection() {
@@ -189,7 +197,8 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       extendBodyBehindAppBar: true,
       body: Stack(
         children: [
-          if (_cameraController != null && _cameraController!.value.isInitialized)
+          if (_cameraController != null &&
+              _cameraController!.value.isInitialized)
             _buildCameraFeedWithBBoxes(),
 
           if (_error != null)
@@ -232,9 +241,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
           height: innerHeight,
           child: Stack(
             children: [
-              Positioned.fill(
-                child: CameraPreview(_cameraController!),
-              ),
+              Positioned.fill(child: CameraPreview(_cameraController!)),
               ..._detections.map((det) {
                 final b = det.boundingBox; // normalized to upright frame
                 return Positioned(
@@ -243,7 +250,8 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
                   width: b.width * innerWidth,
                   height: b.height * innerHeight,
                   child: _BBox(
-                    label: "${det.label} ${(det.confidence * 100).toStringAsFixed(1)}%",
+                    label:
+                        "${det.label} ${(det.confidence * 100).toStringAsFixed(1)}%",
                   ),
                 );
               }),
@@ -256,7 +264,9 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
 
   Widget _header() {
     return Positioned(
-      top: 0, left: 0, right: 0,
+      top: 0,
+      left: 0,
+      right: 0,
       child: SafeArea(
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
@@ -271,11 +281,14 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
                 children: [
                   Icon(Icons.circle, size: 10, color: Colors.green),
                   SizedBox(width: 6),
-                  Text("SYSTEM ACTIVE",
+                  Text(
+                    "SYSTEM ACTIVE",
                     style: TextStyle(
-                      color: Colors.green, fontWeight: FontWeight.bold, fontSize: 12,
+                      color: Colors.green,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
                     ),
-                  )
+                  ),
                 ],
               ),
               const Spacer(),
@@ -289,9 +302,11 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
 
   Widget _circleButton(IconData icon) {
     return Container(
-      width: 40, height: 40,
+      width: 40,
+      height: 40,
       decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.35), shape: BoxShape.circle,
+        color: Colors.black.withOpacity(0.35),
+        shape: BoxShape.circle,
       ),
       child: Icon(icon, color: Colors.white),
     );
@@ -316,14 +331,20 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       width: 85,
       padding: const EdgeInsets.symmetric(vertical: 12),
       decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.45), borderRadius: BorderRadius.circular(16),
+        color: Colors.black.withOpacity(0.45),
+        borderRadius: BorderRadius.circular(16),
       ),
       child: Column(
         children: [
           Text(title, style: const TextStyle(color: Colors.white54)),
           const SizedBox(height: 6),
-          Text(value,
-              style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
+          Text(
+            value,
+            style: const TextStyle(
+              color: Colors.greenAccent,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
         ],
       ),
     );
@@ -332,7 +353,8 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   Widget _controlButton(Size screenSize) {
     return Positioned(
       bottom: screenSize.height * 0.05,
-      left: screenSize.width * 0.1, right: screenSize.width * 0.1,
+      left: screenSize.width * 0.1,
+      right: screenSize.width * 0.1,
       child: GestureDetector(
         onTap: _toggleDetection,
         child: Container(
@@ -385,7 +407,11 @@ class _BBox extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
           child: Text(
             label,
-            style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black),
+            style: const TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+              color: Colors.black,
+            ),
           ),
         ),
       ),

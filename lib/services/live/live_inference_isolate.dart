@@ -29,10 +29,7 @@ class LiveInferenceIsolate {
 
   Future<void> start(Uint8List modelBytes) async {
     final receivePort = ReceivePort();
-    _isolate = await Isolate.spawn(
-      _entry,
-      [receivePort.sendPort, modelBytes],
-    );
+    _isolate = await Isolate.spawn(_entry, [receivePort.sendPort, modelBytes]);
 
     final completer = Completer<void>();
     SendPort? workerPort;
@@ -109,11 +106,13 @@ class LiveInferenceIsolate {
             (src.bottom / h).clamp(0.0, 1.0),
           );
           if (box.width <= 0 || box.height <= 0) continue;
-          normalized.add(Detection(
-            label: det.label,
-            confidence: det.confidence,
-            boundingBox: box,
-          ));
+          normalized.add(
+            Detection(
+              label: det.label,
+              confidence: det.confidence,
+              boundingBox: box,
+            ),
+          );
         }
         reply.send(LiveResult(normalized, sw.elapsedMilliseconds));
       } catch (e) {
