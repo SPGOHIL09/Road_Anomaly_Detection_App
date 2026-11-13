@@ -68,7 +68,7 @@ class HomeScreen extends StatelessWidget {
                         'Upload existing images or high-resolution video recordings for deep AI analysis and reporting.',
                     buttonLabel: 'Upload Media',
                     buttonIcon: Icons.cloud_upload_outlined,
-                    buttonPrimary: false,
+                    buttonPrimary: true,
                     onPressed: () => Navigator.push(context,
                         MaterialPageRoute(builder: (_) => const UploadScreen())),
                   ),

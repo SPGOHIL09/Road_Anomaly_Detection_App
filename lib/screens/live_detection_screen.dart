@@ -1,8 +1,8 @@
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:image/image.dart' as img;
 
 import '../services/inference_isolate.dart';
+import '../services/model_service.dart';
 import '../models/detection.dart';
 import '../theme/app_theme.dart';
 
@@ -14,7 +14,6 @@ class LiveDetectionScreen extends StatefulWidget {
 }
 
 class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
-
   CameraController? _cameraController;
   final InferenceIsolate _inferenceIsolate = InferenceIsolate();
 
@@ -23,6 +22,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
 
   bool _isProcessing = false;
   bool _isDetecting = false;
+  bool _isIsolateReady = false;
 
   double _fps = 0;
   double _cpu = 12;
@@ -33,8 +33,23 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   @override
   void initState() {
     super.initState();
-    _initializeCamera();
-    _inferenceIsolate.start();
+    _initAll();
+  }
+
+  Future<void> _initAll() async {
+    await _initIsolate();
+    await _initializeCamera();
+  }
+
+  Future<void> _initIsolate() async {
+    try {
+      final modelBytes = await ModelService.loadModelBytes();
+      await _inferenceIsolate.start(modelBytes);
+      _isIsolateReady = true;
+      debugPrint("Live isolate ready");
+    } catch (e) {
+      debugPrint("Isolate init error: $e");
+    }
   }
 
   @override
@@ -45,116 +60,77 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   }
 
   Future<void> _initializeCamera() async {
-
     final cameras = await availableCameras();
-
     _cameraController = CameraController(
       cameras.first,
       ResolutionPreset.medium,
       enableAudio: false,
     );
-
     await _cameraController!.initialize();
     await _cameraController!.startImageStream(_processFrame);
-
     setState(() {});
   }
 
   Future<void> _processFrame(CameraImage image) async {
-
-    if (!_isDetecting) return;
+    if (!_isDetecting || !_isIsolateReady) return;
 
     final now = DateTime.now();
-
     if (now.difference(_lastInference) < _inferenceInterval) return;
     if (_isProcessing) return;
 
     _isProcessing = true;
+    final start = DateTime.now();
 
     try {
+      final planeY = image.planes[0];
+      final planeU = image.planes[1];
+      final planeV = image.planes[2];
 
-      final start = DateTime.now();
+      // 🔥 Send lightweight raw bytes to background without blocking UI
+      _inferenceIsolate.runFromCamera(
+        image.width,
+        image.height,
+        planeY.bytes,
+        planeU.bytes,
+        planeV.bytes,
+        planeU.bytesPerRow,
+        planeU.bytesPerPixel!,
+      ).then((detections) {
+        if (mounted && _isDetecting) {
+          final smoothed = _smoothDetections(detections);
+          final end = DateTime.now();
+          final frameTime = end.difference(start).inMilliseconds;
 
-      final img.Image rgb = _convertCameraImage(image);
-
-      final detections = await _inferenceIsolate.run(rgb);
-
-      final smoothed = _smoothDetections(detections);
-
-      final end = DateTime.now();
-      final frameTime = end.difference(start).inMilliseconds;
-
-      setState(() {
-        _detections = smoothed;
-        _fps = 1000 / frameTime;
+          setState(() {
+            _detections = smoothed;
+            _fps = frameTime > 0 ? 1000 / frameTime : 0;
+          });
+        }
+        _lastInference = DateTime.now();
+        _isProcessing = false;
+      }).catchError((e) {
+        debugPrint("Detection error: $e");
+        _isProcessing = false;
       });
 
-      _lastInference = DateTime.now();
-
     } catch (e) {
-      debugPrint("Detection error: $e");
+      debugPrint("Stream extraction error: $e");
+      _isProcessing = false;
     }
-
-    _isProcessing = false;
-  }
-
-  img.Image _convertCameraImage(CameraImage cameraImage) {
-
-    final width = cameraImage.width;
-    final height = cameraImage.height;
-
-    final img.Image imgBuffer = img.Image(width: width, height: height);
-
-    final planeY = cameraImage.planes[0];
-    final planeU = cameraImage.planes[1];
-    final planeV = cameraImage.planes[2];
-
-    final uvRowStride = planeU.bytesPerRow;
-    final uvPixelStride = planeU.bytesPerPixel!;
-
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-
-        final uvIndex =
-            uvPixelStride * (x ~/ 2) + uvRowStride * (y ~/ 2);
-
-        final index = y * width + x;
-
-        final yp = planeY.bytes[index];
-        final up = planeU.bytes[uvIndex];
-        final vp = planeV.bytes[uvIndex];
-
-        int r = (yp + vp * 1436 / 1024 - 179).round();
-        int g = (yp - up * 46549 / 131072 + 44 - vp * 93604 / 131072 + 91).round();
-        int b = (yp + up * 1814 / 1024 - 227).round();
-
-        r = r.clamp(0, 255);
-        g = g.clamp(0, 255);
-        b = b.clamp(0, 255);
-
-        imgBuffer.setPixelRgb(x, y, r, g, b);
-      }
-    }
-
-    return imgBuffer;
   }
 
   List<Detection> _smoothDetections(List<Detection> newDetections) {
-
     if (_previousDetections.isEmpty) {
       _previousDetections = newDetections;
       return newDetections;
     }
 
     List<Detection> smoothed = [];
-
     for (int i = 0; i < newDetections.length; i++) {
-
       if (i >= _previousDetections.length) {
         smoothed.add(newDetections[i]);
         continue;
       }
-
       final oldBox = _previousDetections[i].boundingBox;
       final newBox = newDetections[i].boundingBox;
 
@@ -173,17 +149,15 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
         ),
       );
     }
-
     _previousDetections = smoothed;
     return smoothed;
   }
 
-  Rect _scaleBox(Rect box, Size screenSize) {
-
-    const modelSize = 640;
-
-    final scaleX = screenSize.width / modelSize;
-    final scaleY = screenSize.height / modelSize;
+  // UPDATED: Now scales to the internal camera aspect ratio container rather than the screen
+  Rect _scaleBox(Rect box, double innerWidth, double innerHeight) {
+    const modelSize = 640.0; // Assuming 640x640 YOLO input
+    final scaleX = innerWidth / modelSize;
+    final scaleY = innerHeight / modelSize;
 
     return Rect.fromLTWH(
       box.left * scaleX,
@@ -194,11 +168,8 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   }
 
   void _toggleDetection() {
-
     setState(() {
-
       _isDetecting = !_isDetecting;
-
       if (!_isDetecting) {
         _detections.clear();
         _previousDetections.clear();
@@ -208,7 +179,6 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
 
   @override
   Widget build(BuildContext context) {
-
     final screenSize = MediaQuery.of(context).size;
 
     return Scaffold(
@@ -216,77 +186,89 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       extendBodyBehindAppBar: true,
       body: Stack(
         children: [
-
-          if (_cameraController != null &&
-              _cameraController!.value.isInitialized)
-            Positioned.fill(
-              child: CameraPreview(_cameraController!),
-            ),
-
-          ..._detections.map((det) {
-
-            final box = _scaleBox(det.boundingBox, screenSize);
-
-            return Positioned(
-              left: box.left,
-              top: box.top,
-              width: box.width,
-              height: box.height,
-              child: _BBox(
-                label:
-                "${det.label} ${(det.confidence * 100).toStringAsFixed(1)}%",
-              ),
-            );
-          }),
+          if (_cameraController != null && _cameraController!.value.isInitialized)
+            _buildCameraFeedWithBBoxes(), // UPDATED: Replaced direct Positioned.fill
 
           _header(),
-
           _statsPanel(screenSize),
-
           _controlButton(screenSize),
         ],
       ),
     );
   }
 
+  // NEW METHOD: Handles the native, un-squeezed camera view and aligned bounding boxes
+  Widget _buildCameraFeedWithBBoxes() {
+    final size = MediaQuery.of(context).size;
+    final cameraRatio = _cameraController!.value.aspectRatio;
+
+    // We set an arbitrary base dimension for the inner canvas.
+    // The FittedBox will scale this up perfectly to the actual screen size.
+    const double baseDimension = 1000.0;
+    final double innerWidth = baseDimension;
+    final double innerHeight = baseDimension * cameraRatio;
+
+    return SizedBox(
+      width: size.width,
+      height: size.height,
+      child: FittedBox(
+        fit: BoxFit.cover, // Scales up to fill screen, cropping edges without squeezing
+        child: SizedBox(
+          width: innerWidth,
+          height: innerHeight,
+          child: Stack(
+            children: [
+              // 1. The Camera Feed
+              Positioned.fill(
+                child: CameraPreview(_cameraController!),
+              ),
+
+              // 2. The Bounding Boxes
+              ..._detections.map((det) {
+                // Scale boxes relative to the inner container, NOT the screen
+                final box = _scaleBox(det.boundingBox, innerWidth, innerHeight);
+                return Positioned(
+                  left: box.left,
+                  top: box.top,
+                  width: box.width,
+                  height: box.height,
+                  child: _BBox(
+                    label: "${det.label} ${(det.confidence * 100).toStringAsFixed(1)}%",
+                  ),
+                );
+              }),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _header() {
     return Positioned(
-      top: 0,
-      left: 0,
-      right: 0,
+      top: 0, left: 0, right: 0,
       child: SafeArea(
-        bottom: false,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           child: Row(
             children: [
-              /// Back
               GestureDetector(
                 onTap: () => Navigator.pop(context),
                 child: _circleButton(Icons.arrow_back),
               ),
-
               const SizedBox(width: 12),
-
               const Row(
                 children: [
                   Icon(Icons.circle, size: 10, color: Colors.green),
                   SizedBox(width: 6),
-                  Text(
-                    "SYSTEM ACTIVE",
+                  Text("SYSTEM ACTIVE",
                     style: TextStyle(
-                      color: Colors.green,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 12,
-                      letterSpacing: 1.2,
+                      color: Colors.green, fontWeight: FontWeight.bold, fontSize: 12,
                     ),
                   )
                 ],
               ),
-
               const Spacer(),
-
-              /// Settings
               _circleButton(Icons.settings),
             ],
           ),
@@ -297,11 +279,9 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
 
   Widget _circleButton(IconData icon) {
     return Container(
-      width: 40,
-      height: 40,
+      width: 40, height: 40,
       decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.35),
-        shape: BoxShape.circle,
+        color: Colors.black.withOpacity(0.35), shape: BoxShape.circle,
       ),
       child: Icon(icon, color: Colors.white),
     );
@@ -326,27 +306,14 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       width: 85,
       padding: const EdgeInsets.symmetric(vertical: 12),
       decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.45),
-        borderRadius: BorderRadius.circular(16),
+        color: Colors.black.withOpacity(0.45), borderRadius: BorderRadius.circular(16),
       ),
       child: Column(
         children: [
-          Text(
-            title,
-            style: const TextStyle(
-              color: Colors.white54,
-              fontSize: 12,
-            ),
-          ),
+          Text(title, style: const TextStyle(color: Colors.white54)),
           const SizedBox(height: 6),
-          Text(
-            value,
-            style: const TextStyle(
-              color: Colors.greenAccent,
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
+          Text(value,
+              style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
         ],
       ),
     );
@@ -355,8 +322,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   Widget _controlButton(Size screenSize) {
     return Positioned(
       bottom: screenSize.height * 0.05,
-      left: screenSize.width * 0.1,
-      right: screenSize.width * 0.1,
+      left: screenSize.width * 0.1, right: screenSize.width * 0.1,
       child: GestureDetector(
         onTap: _toggleDetection,
         child: Container(
@@ -376,17 +342,11 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
                 Icon(
                   _isDetecting ? Icons.stop_circle : Icons.play_circle_fill,
                   color: Colors.white,
-                  size: 26,
                 ),
                 const SizedBox(width: 10),
                 Text(
                   _isDetecting ? "STOP DETECTION" : "START DETECTION",
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 17,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.2,
-                  ),
+                  style: const TextStyle(color: Colors.white),
                 ),
               ],
             ),
@@ -398,34 +358,24 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
 }
 
 class _BBox extends StatelessWidget {
-
   final String label;
 
   const _BBox({required this.label});
 
   @override
   Widget build(BuildContext context) {
-
     return Container(
       decoration: BoxDecoration(
-        border: Border.all(
-          color: AppColors.neonGreen,
-          width: 2,
-        ),
+        border: Border.all(color: AppColors.neonGreen, width: 2),
       ),
       child: Align(
         alignment: Alignment.topLeft,
         child: Container(
-          padding:
-          const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
           color: AppColors.neonGreen,
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
           child: Text(
             label,
-            style: const TextStyle(
-              fontSize: 10,
-              fontWeight: FontWeight.bold,
-              color: Colors.black,
-            ),
+            style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black),
           ),
         ),
       ),
