@@ -1,11 +1,20 @@
-import 'package:camera/camera.dart';
-import 'package:flutter/material.dart';
-import 'package:image/image.dart' as img;
+import 'dart:io';
 
-import '../services/inference_isolate.dart';
+import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+
+import '../services/live/detection_tracker.dart';
+import '../services/live/live_frame.dart';
+import '../services/live/live_inference_isolate.dart';
+import '../services/detector/gpu_detector_service.dart';
+import '../services/model_service.dart';
 import '../models/detection.dart';
 import '../theme/app_theme.dart';
 
+/// Live camera detection. Uses its own pipeline under `services/live/`
+/// (separate from the upload pipeline): camera frame -> [LiveFrame] ->
+/// [LiveInferenceIsolate] -> [DetectionTracker] -> overlay.
 class LiveDetectionScreen extends StatefulWidget {
   const LiveDetectionScreen({super.key});
 
@@ -14,201 +23,208 @@ class LiveDetectionScreen extends StatefulWidget {
 }
 
 class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
-
   CameraController? _cameraController;
-  final InferenceIsolate _inferenceIsolate = InferenceIsolate();
+  CameraDescription? _camera;
+  final LiveInferenceIsolate _inferenceIsolate = LiveInferenceIsolate();
+  final DetectionTracker _tracker = DetectionTracker();
 
+  /// Boxes normalized (0..1) to the upright camera frame.
   List<Detection> _detections = [];
-  List<Detection> _previousDetections = [];
 
   bool _isProcessing = false;
   bool _isDetecting = false;
+  bool _isIsolateReady = false;
+  bool _disposed = false;
+  bool _loggedFirstFrame = false;
+  String? _error;
 
   double _fps = 0;
-  double _cpu = 12;
+
+  /// Which engine ran the last detection ('GPU' or 'CPU').
+  String _engine = '—';
 
   DateTime _lastInference = DateTime.now();
-  final Duration _inferenceInterval = const Duration(milliseconds: 120);
+  DateTime? _lastResultAt;
+
+  /// Minimum gap between frames sent for detection (GPU ~50 ms per frame).
+  final Duration _inferenceInterval = const Duration(milliseconds: 66);
+
+  /// Incremented when detection stops so late results are discarded.
+  int _session = 0;
 
   @override
   void initState() {
     super.initState();
-    _initializeCamera();
-    _inferenceIsolate.start();
+    _initAll();
+  }
+
+  Future<void> _initAll() async {
+    await _initIsolate();
+    await _initializeCamera();
+  }
+
+  Future<void> _initIsolate() async {
+    try {
+      final modelBytes = await ModelService.loadModelBytes();
+      await _inferenceIsolate.start(modelBytes, gpu: GpuDetectorService.port);
+      if (GpuDetectorService.port == null) {
+        GpuDetectorService.portListenable.addListener(_onGpuReady);
+      }
+      _isIsolateReady = true;
+      debugPrint("Live isolate ready");
+    } catch (e) {
+      debugPrint("Isolate init error: $e");
+      if (mounted) setState(() => _error = "Model failed to load: $e");
+    }
+  }
+
+  /// The shared GPU engine finished starting: move live detection onto it.
+  void _onGpuReady() {
+    final gpu = GpuDetectorService.port;
+    if (gpu == null || _disposed) return;
+    GpuDetectorService.portListenable.removeListener(_onGpuReady);
+    _inferenceIsolate.useGpu(gpu);
   }
 
   @override
   void dispose() {
-    _cameraController?.dispose();
+    GpuDetectorService.portListenable.removeListener(_onGpuReady);
+    _disposed = true;
+    final controller = _cameraController;
+    _cameraController = null;
+    if (controller != null) {
+      if (controller.value.isStreamingImages) {
+        controller.stopImageStream().catchError((_) {});
+      }
+      controller.dispose();
+    }
     _inferenceIsolate.dispose();
     super.dispose();
   }
 
   Future<void> _initializeCamera() async {
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        if (mounted) setState(() => _error = "No camera found on this device");
+        return;
+      }
+      _camera = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
 
-    final cameras = await availableCameras();
-
-    _cameraController = CameraController(
-      cameras.first,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
-
-    await _cameraController!.initialize();
-    await _cameraController!.startImageStream(_processFrame);
-
-    setState(() {});
+      final controller = CameraController(
+        _camera!,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        // Android streams YUV planes, iOS streams a single BGRA plane.
+        imageFormatGroup: Platform.isIOS
+            ? ImageFormatGroup.bgra8888
+            : ImageFormatGroup.yuv420,
+      );
+      await controller.initialize();
+      if (_disposed) {
+        controller.dispose();
+        return;
+      }
+      _cameraController = controller;
+      await controller.startImageStream(_processFrame);
+      if (mounted) setState(() {});
+    } on CameraException catch (e) {
+      debugPrint("Camera error: ${e.code} ${e.description}");
+      if (mounted) {
+        setState(
+          () => _error = e.code == 'CameraAccessDenied'
+              ? "Camera permission denied. Enable it in Settings."
+              : "Camera error: ${e.description ?? e.code}",
+        );
+      }
+    } catch (e) {
+      debugPrint("Camera error: $e");
+      if (mounted) setState(() => _error = "Camera error: $e");
+    }
   }
 
-  Future<void> _processFrame(CameraImage image) async {
-
-    if (!_isDetecting) return;
+  void _processFrame(CameraImage image) {
+    if (!_isDetecting || !_isIsolateReady || _isProcessing) return;
 
     final now = DateTime.now();
-
     if (now.difference(_lastInference) < _inferenceInterval) return;
-    if (_isProcessing) return;
+
+    final camera = _camera;
+    if (camera == null) return;
+
+    final frame = LiveFrame.fromCameraImage(
+      image,
+      sensorOrientation: camera.sensorOrientation,
+      mirror: camera.lensDirection == CameraLensDirection.front,
+    );
+    if (frame == null) {
+      debugPrint("Unsupported camera format: ${image.format.group}");
+      return;
+    }
+
+    if (!kReleaseMode && !_loggedFirstFrame) {
+      _loggedFirstFrame = true;
+      debugPrint(
+        "📷 live: first frame ${image.width}x${image.height} "
+        "${image.format.group.name}, planes=${image.planes.length}, "
+        "rotation=${frame.rotation}",
+      );
+    }
 
     _isProcessing = true;
+    _lastInference = now;
+    final session = _session;
 
-    try {
-
-      final start = DateTime.now();
-
-      final img.Image rgb = _convertCameraImage(image);
-
-      final detections = await _inferenceIsolate.run(rgb);
-
-      final smoothed = _smoothDetections(detections);
-
-      final end = DateTime.now();
-      final frameTime = end.difference(start).inMilliseconds;
-
-      setState(() {
-        _detections = smoothed;
-        _fps = 1000 / frameTime;
-      });
-
-      _lastInference = DateTime.now();
-
-    } catch (e) {
-      debugPrint("Detection error: $e");
-    }
-
-    _isProcessing = false;
-  }
-
-  img.Image _convertCameraImage(CameraImage cameraImage) {
-
-    final width = cameraImage.width;
-    final height = cameraImage.height;
-
-    final img.Image imgBuffer = img.Image(width: width, height: height);
-
-    final planeY = cameraImage.planes[0];
-    final planeU = cameraImage.planes[1];
-    final planeV = cameraImage.planes[2];
-
-    final uvRowStride = planeU.bytesPerRow;
-    final uvPixelStride = planeU.bytesPerPixel!;
-
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-
-        final uvIndex =
-            uvPixelStride * (x ~/ 2) + uvRowStride * (y ~/ 2);
-
-        final index = y * width + x;
-
-        final yp = planeY.bytes[index];
-        final up = planeU.bytes[uvIndex];
-        final vp = planeV.bytes[uvIndex];
-
-        int r = (yp + vp * 1436 / 1024 - 179).round();
-        int g = (yp - up * 46549 / 131072 + 44 - vp * 93604 / 131072 + 91).round();
-        int b = (yp + up * 1814 / 1024 - 227).round();
-
-        r = r.clamp(0, 255);
-        g = g.clamp(0, 255);
-        b = b.clamp(0, 255);
-
-        imgBuffer.setPixelRgb(x, y, r, g, b);
-      }
-    }
-
-    return imgBuffer;
-  }
-
-  List<Detection> _smoothDetections(List<Detection> newDetections) {
-
-    if (_previousDetections.isEmpty) {
-      _previousDetections = newDetections;
-      return newDetections;
-    }
-
-    List<Detection> smoothed = [];
-
-    for (int i = 0; i < newDetections.length; i++) {
-
-      if (i >= _previousDetections.length) {
-        smoothed.add(newDetections[i]);
-        continue;
-      }
-
-      final oldBox = _previousDetections[i].boundingBox;
-      final newBox = newDetections[i].boundingBox;
-
-      final smoothBox = Rect.fromLTWH(
-        oldBox.left * 0.7 + newBox.left * 0.3,
-        oldBox.top * 0.7 + newBox.top * 0.3,
-        oldBox.width * 0.7 + newBox.width * 0.3,
-        oldBox.height * 0.7 + newBox.height * 0.3,
-      );
-
-      smoothed.add(
-        Detection(
-          label: newDetections[i].label,
-          confidence: newDetections[i].confidence,
-          boundingBox: smoothBox,
-        ),
-      );
-    }
-
-    _previousDetections = smoothed;
-    return smoothed;
-  }
-
-  Rect _scaleBox(Rect box, Size screenSize) {
-
-    const modelSize = 640;
-
-    final scaleX = screenSize.width / modelSize;
-    final scaleY = screenSize.height / modelSize;
-
-    return Rect.fromLTWH(
-      box.left * scaleX,
-      box.top * scaleY,
-      box.width * scaleX,
-      box.height * scaleY,
-    );
+    // 🔥 Heavy work (colour conversion, resize, inference) runs in the
+    // live isolate; the UI thread only hands over the plane buffers.
+    _inferenceIsolate
+        .process(frame)
+        .then((result) {
+          if (!mounted || !_isDetecting || session != _session) return;
+          if (!kReleaseMode) {
+            debugPrint(
+              "📷 live: ${result.detections.length} detections "
+              "(${result.inferenceMs}ms, ${result.engine})",
+            );
+          }
+          final smoothed = _tracker.update(result.detections);
+          final at = DateTime.now();
+          final last = _lastResultAt;
+          _lastResultAt = at;
+          setState(() {
+            _engine = result.engine;
+            _detections = smoothed;
+            if (last != null) {
+              final instant =
+                  1000 / at.difference(last).inMilliseconds.clamp(1, 100000);
+              _fps = _fps == 0 ? instant : _fps * 0.7 + instant * 0.3;
+            }
+          });
+        })
+        .catchError((e) {
+          debugPrint("Detection error: $e");
+        })
+        .whenComplete(() {
+          _isProcessing = false;
+        });
   }
 
   void _toggleDetection() {
-
     setState(() {
-
       _isDetecting = !_isDetecting;
-
-      if (!_isDetecting) {
-        _detections.clear();
-        _previousDetections.clear();
-      }
+      _session++;
+      _detections = [];
+      _tracker.reset();
+      _lastResultAt = null;
+      _fps = 0;
     });
   }
 
   @override
   Widget build(BuildContext context) {
-
     final screenSize = MediaQuery.of(context).size;
 
     return Scaffold(
@@ -216,35 +232,67 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       extendBodyBehindAppBar: true,
       body: Stack(
         children: [
-
           if (_cameraController != null &&
               _cameraController!.value.isInitialized)
-            Positioned.fill(
-              child: CameraPreview(_cameraController!),
+            _buildCameraFeedWithBBoxes(),
+
+          if (_error != null)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(32),
+                child: Text(
+                  _error!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70, fontSize: 16),
+                ),
+              ),
             ),
 
-          ..._detections.map((det) {
-
-            final box = _scaleBox(det.boundingBox, screenSize);
-
-            return Positioned(
-              left: box.left,
-              top: box.top,
-              width: box.width,
-              height: box.height,
-              child: _BBox(
-                label:
-                "${det.label} ${(det.confidence * 100).toStringAsFixed(1)}%",
-              ),
-            );
-          }),
-
           _header(),
-
           _statsPanel(screenSize),
-
           _controlButton(screenSize),
         ],
+      ),
+    );
+  }
+
+  /// Camera preview and boxes share one portrait canvas with the preview's
+  /// aspect ratio, scaled to cover the screen, so boxes stay aligned.
+  Widget _buildCameraFeedWithBBoxes() {
+    final size = MediaQuery.of(context).size;
+    final previewRatio = _cameraController!.value.aspectRatio; // landscape w/h
+
+    const double baseDimension = 1000.0;
+    const double innerWidth = baseDimension;
+    final double innerHeight = baseDimension * previewRatio;
+
+    return SizedBox(
+      width: size.width,
+      height: size.height,
+      child: FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: innerWidth,
+          height: innerHeight,
+          child: Stack(
+            children: [
+              Positioned.fill(child: CameraPreview(_cameraController!)),
+              ..._detections.map((det) {
+                final b = det.boundingBox; // normalized to upright frame
+                return Positioned(
+                  left: b.left * innerWidth,
+                  top: b.top * innerHeight,
+                  width: b.width * innerWidth,
+                  height: b.height * innerHeight,
+                  child: _BBox(
+                    label:
+                        "${det.label} ${(det.confidence * 100).toStringAsFixed(1)}%",
+                  ),
+                );
+              }),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -255,19 +303,15 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       left: 0,
       right: 0,
       child: SafeArea(
-        bottom: false,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           child: Row(
             children: [
-              /// Back
               GestureDetector(
                 onTap: () => Navigator.pop(context),
                 child: _circleButton(Icons.arrow_back),
               ),
-
               const SizedBox(width: 12),
-
               const Row(
                 children: [
                   Icon(Icons.circle, size: 10, color: Colors.green),
@@ -278,15 +322,11 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
                       color: Colors.green,
                       fontWeight: FontWeight.bold,
                       fontSize: 12,
-                      letterSpacing: 1.2,
                     ),
-                  )
+                  ),
                 ],
               ),
-
               const Spacer(),
-
-              /// Settings
               _circleButton(Icons.settings),
             ],
           ),
@@ -315,7 +355,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
         children: [
           _statCard("FPS", _fps.toStringAsFixed(1)),
           const SizedBox(height: 12),
-          _statCard("CPU", "${_cpu.toStringAsFixed(0)}%"),
+          _statCard("ENGINE", _engine),
         ],
       ),
     );
@@ -331,19 +371,12 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
       ),
       child: Column(
         children: [
-          Text(
-            title,
-            style: const TextStyle(
-              color: Colors.white54,
-              fontSize: 12,
-            ),
-          ),
+          Text(title, style: const TextStyle(color: Colors.white54)),
           const SizedBox(height: 6),
           Text(
             value,
             style: const TextStyle(
               color: Colors.greenAccent,
-              fontSize: 18,
               fontWeight: FontWeight.bold,
             ),
           ),
@@ -376,17 +409,11 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
                 Icon(
                   _isDetecting ? Icons.stop_circle : Icons.play_circle_fill,
                   color: Colors.white,
-                  size: 26,
                 ),
                 const SizedBox(width: 10),
                 Text(
                   _isDetecting ? "STOP DETECTION" : "START DETECTION",
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 17,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.2,
-                  ),
+                  style: const TextStyle(color: Colors.white),
                 ),
               ],
             ),
@@ -398,27 +425,21 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
 }
 
 class _BBox extends StatelessWidget {
-
   final String label;
 
   const _BBox({required this.label});
 
   @override
   Widget build(BuildContext context) {
-
     return Container(
       decoration: BoxDecoration(
-        border: Border.all(
-          color: AppColors.neonGreen,
-          width: 2,
-        ),
+        border: Border.all(color: AppColors.neonGreen, width: 2),
       ),
       child: Align(
         alignment: Alignment.topLeft,
         child: Container(
-          padding:
-          const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
           color: AppColors.neonGreen,
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
           child: Text(
             label,
             style: const TextStyle(

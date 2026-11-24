@@ -35,13 +35,16 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   google_fonts: ^6.2.0
-  camera: ^0.10.5+9
-  onnxruntime: ^1.4.1
+  camera: ^0.11.2+1
+  onnxruntime_v2: ^1.23.2+1
   image: ^4.1.7
   path_provider: ^2.1.2
   file_picker: ^10.3.10
   video_player: ^2.10.0
   video_thumbnail: ^0.5.3
+  opencv_dart: ^1.4.5
+  tflite_flutter: ^0.12.1
+  ffi: ^2.2.0
 
 
 
@@ -68,6 +71,7 @@ flutter:
   uses-material-design: true
   assets:
     - assets/models/best.onnx
+    - assets/models/best_gpu_fp16.tflite
 
   # To add assets to your application, add an assets section, like this:
   # assets:

@@ -1,157 +1,194 @@
-import 'dart:typed_data';
-import 'package:image/image.dart' as img;
-import 'package:onnxruntime/onnxruntime.dart';
-import 'package:flutter/services.dart';
+import 'dart:io';
 
-import 'package:road_anomaly_detector/utils/nms.dart';
-import 'package:road_anomaly_detector/utils/yolo_decoder.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
+import 'package:onnxruntime_v2/onnxruntime_v2.dart';
 
 import '../models/detection.dart';
 import '../utils/preprocessing.dart';
+import '../utils/yolo_decoder.dart';
+import '../utils/nms.dart';
 
+/// Shared detector core: runs the ONNX model and decodes YOLO output.
+///
+/// Pipelines (image upload, video upload, live camera) each own their own
+/// isolate and preprocessing; they all call into this class for inference.
 class ModelService {
-
-  // ───────── Singleton Instance ─────────
-
-  static final ModelService _instance = ModelService._internal();
-
-  factory ModelService() {
-    return _instance;
-  }
-
-  ModelService._internal();
-
-  // ───────── Model Variables ─────────
-
   OrtSession? _session;
 
-  bool _isLoaded = false;
+  ModelService();
 
-  bool get isLoaded => _isLoaded;
+  ModelService.withSession(this._session);
 
-  // ───────── Load Model ─────────
-
-  Future<void> loadModel() async {
-
-    if (_isLoaded) return;
-
-    try {
-
-      final modelBytes =
-      await rootBundle.load('assets/models/best.onnx');
-
-      final Uint8List bytes =
-      modelBytes.buffer.asUint8List();
-
-      final sessionOptions = OrtSessionOptions();
-
-      _session =
-      await OrtSession.fromBuffer(bytes, sessionOptions);
-
-      sessionOptions.release();
-
-      _isLoaded = true;
-
-      print("ONNX Model Loaded Successfully");
-
-    } catch (e) {
-
-      print("Model loading failed: $e");
-
-      rethrow;
-    }
+  /// Frees the native session (call when a worker isolate is done).
+  void release() {
+    _session?.release();
+    _session = null;
   }
 
-  // ───────── Flatten ONNX Tensor Safely ─────────
+  // ───────── Load Model Bytes ─────────
 
-  List<double> _flattenTensor(dynamic tensor) {
+  static Future<Uint8List> loadModelBytes() async {
+    final data = await rootBundle.load('assets/models/best.onnx');
+    return data.buffer.asUint8List();
+  }
 
-    if (tensor is double) {
-      return [tensor];
+  /// CPU threads used for inference on Android.
+  ///
+  /// Measured on a Pixel 9 (YOLO11s, 640x640, one inference):
+  ///   NNAPI via appendDefaultProviders  1439 ms
+  ///   NNAPI fp16                         653 ms
+  ///   CPU, ORT default thread count     1928 ms
+  ///   CPU 2 / 3 / 4 / 5 / 6 / 8 threads  396 / 275 / 213-232 / 422 / 436 / 447 ms
+  ///   XNNPACK, 4 threads                 219 ms
+  /// Four threads match the phone's four performance cores; using the
+  /// efficiency cores as well makes every thread wait for the slowest one.
+  static const int androidInferenceThreads = 4;
+
+  /// Creates a session inside the calling isolate (same options everywhere).
+  static Future<OrtSession> createSession(Uint8List modelBytes) async {
+    final sessionOptions = OrtSessionOptions();
+    if (Platform.isAndroid) {
+      final cores = Platform.numberOfProcessors;
+      sessionOptions.setIntraOpNumThreads(
+        cores < androidInferenceThreads ? cores : androidInferenceThreads,
+      );
+    } else {
+      // iOS: CoreML via the default providers (not benchmarked yet).
+      try {
+        await sessionOptions.appendDefaultProviders();
+      } catch (_) {}
+    }
+    final session = OrtSession.fromBuffer(modelBytes, sessionOptions);
+    sessionOptions.release();
+    return session;
+  }
+
+  // ───────── Flatten Tensor ─────────
+
+  /// Flattens the nested-list tensor value into a contiguous [Float32List].
+  static Float32List flattenTensor(dynamic tensor) {
+    if (tensor is double) return Float32List.fromList([tensor]);
+
+    // Walk the first elements to find the total element count.
+    int total = 1;
+    dynamic probe = tensor;
+    while (probe is List) {
+      total *= probe.length;
+      if (probe.isEmpty) break;
+      probe = probe[0];
     }
 
-    if (tensor is List) {
-      return tensor.expand((e) => _flattenTensor(e)).toList();
+    final out = Float32List(total);
+    int index = 0;
+    void fill(dynamic node) {
+      if (node is Float32List) {
+        out.setRange(index, index + node.length, node);
+        index += node.length;
+      } else if (node is List) {
+        if (node.isNotEmpty && node[0] is! List) {
+          for (final v in node) {
+            out[index++] = (v as num).toDouble();
+          }
+        } else {
+          for (final child in node) {
+            fill(child);
+          }
+        }
+      }
     }
 
-    return [];
+    fill(tensor);
+    return out;
   }
 
   // ───────── Run Inference ─────────
 
-  Future<List<dynamic>> _runInference(List<double> input) async {
-
+  Float32List _runInference(List<double> input) {
     if (_session == null) {
-      throw Exception("Model session not initialized");
+      throw Exception("ONNX session not initialized");
     }
 
-    final Float32List floatInput =
-    Float32List.fromList(input);
-
     final inputTensor = OrtValueTensor.createTensorWithDataList(
-      floatInput,
-      [1, 3, 640, 640],
+      input is Float32List ? input : Float32List.fromList(input),
+      [1, 3, kModelInputSize, kModelInputSize],
     );
 
     final runOptions = OrtRunOptions();
 
-    final outputs = await _session!.run(
-      runOptions,
-      {'images': inputTensor},
-    );
+    final outputs = _session!.run(runOptions, {'images': inputTensor});
 
     inputTensor.release();
     runOptions.release();
 
-    return outputs;
+    try {
+      final rawTensor = (outputs.first as OrtValueTensor).value;
+      return flattenTensor(rawTensor);
+    } finally {
+      // Native output buffers are not garbage collected; release them so
+      // continuous video / camera inference does not leak memory.
+      for (final o in outputs) {
+        o?.release();
+      }
+    }
   }
 
-  // ───────── Image Detection ─────────
+  // ───────── Detection (model space) ─────────
+
+  /// Runs the model on a prepared 640x640 CHW tensor.
+  ///
+  /// Returned boxes are in model-input (letterboxed 640x640) coordinates.
+  List<Detection> detectTensor(
+    List<double> input, {
+    double confidenceThreshold = 0.3,
+    double iouThreshold = 0.3,
+  }) {
+    final rawOutput = _runInference(input);
+    final decoded = decodeYOLO(rawOutput, confidenceThreshold);
+    return nonMaxSupression(decoded, iouThreshold);
+  }
+
+  // ───────── Detection (image upload) ─────────
 
   Future<List<Detection>> detectImage(
-      img.Image image, {
-        double confidenceThreshold = 0.3,
-        double iouThreshold = 0.55,
-      }) async {
-
-    if (!_isLoaded) {
-      throw Exception("Model not loaded");
-    }
-
+    img.Image image, {
+    double confidenceThreshold = 0.3, // Lowered from 0.1 to catch more defects
+    double iouThreshold =
+        0.3, // Lowered from 0.5 to be less aggressive with NMS
+  }) async {
     try {
+      // 🔥 Preprocess with metadata
+      final result = preprocess(image);
 
+      final filtered = detectTensor(
+        result.input,
+        confidenceThreshold: confidenceThreshold,
+        iouThreshold: iouThreshold,
+      );
+      debugPrint(
+        "🔍 After NMS: ${filtered.length} detections (IOU threshold: $iouThreshold)",
+      );
 
-      // Preprocess image
-      final input = preprocess(image);
+      // 🔥 FIX: Reverse letterbox mapping
+      final corrected = filtered.map((det) {
+        final box = det.boundingBox;
 
-      print("Running inference...");
-      // Run inference
-      final outputs = await _runInference(input);
+        final x = (box.left - result.xOffset) / result.scale;
+        final y = (box.top - result.yOffset) / result.scale;
+        final w = box.width / result.scale;
+        final h = box.height / result.scale;
 
-      // Extract ONNX tensor
-      final rawTensor =
-          (outputs.first as OrtValueTensor).value;
+        return Detection(
+          label: det.label,
+          confidence: det.confidence,
+          boundingBox: Rect.fromLTWH(x, y, w, h),
+        );
+      }).toList();
 
-      // Flatten tensor
-      final List<double> rawOutput =
-      _flattenTensor(rawTensor);
-      print("Output length: ${rawOutput.length}");
-
-      // Decode YOLO predictions
-      final decoded =
-      decodeYOLO(rawOutput, confidenceThreshold);
-
-      // Apply Non-Max Suppression
-      final filtered =
-      nonMaxSupression(decoded, iouThreshold);
-      print("Detections found: ${filtered.length}");
-
-      return filtered;
-
+      return corrected;
     } catch (e) {
-
-      print("Detection error: $e");
-
+      debugPrint("Detection error: $e");
       return [];
     }
   }
