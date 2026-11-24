@@ -22,6 +22,11 @@ class VideoDetectionTrack {
 
   int get sampleCount => _times.length;
 
+  /// All scanned frames in time order: (timestamp ms, detections).
+  List<(int, List<Detection>)> get samples => [
+    for (int i = 0; i < _times.length; i++) (_times[i], _dets[i]),
+  ];
+
   /// Latest video time covered by analysis (-1 if nothing yet).
   int get analyzedUntilMs => _times.isEmpty ? -1 : _times.last;
 

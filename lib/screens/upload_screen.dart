@@ -13,6 +13,7 @@ import 'package:road_anomaly_detector/models/detection.dart';
 import 'package:road_anomaly_detector/services/inference_isolate.dart';
 import 'package:road_anomaly_detector/services/detector/gpu_detector_service.dart';
 import 'package:road_anomaly_detector/services/upload/video_analysis_service.dart';
+import 'package:road_anomaly_detector/services/upload/defect_tracks.dart';
 import 'package:road_anomaly_detector/services/upload/video_detection_track.dart';
 
 /// Upload pipeline: still images go through [InferenceIsolate]; videos are
@@ -45,10 +46,6 @@ class _UploadScreenState extends State<UploadScreen>
   static const int _minDetectIntervalMs = 100;
   static const int _sampleIntervalMs = 500;
 
-  /// Playback starts (or resumes) once detections cover this much video
-  /// ahead of the playhead: the "short delay" before smooth playback.
-  static const int _resumeAheadMs = 500;
-
   Uint8List? _modelBytes;
   VideoPlayerController? _video;
   final VideoAnalysisService _analysis = VideoAnalysisService(
@@ -59,12 +56,14 @@ class _UploadScreenState extends State<UploadScreen>
   VideoDetectionTrack _track = VideoDetectionTrack(
     sampleIntervalMs: _sampleIntervalMs,
   );
+
+  /// Stable per-defect tracks built from the whole-video scan.
+  DefectTracks _defects = DefectTracks.empty;
   final ValueNotifier<List<Detection>> _videoBoxes = ValueNotifier(const []);
   late final Ticker _ticker;
 
   bool _analyzing = false;
-  bool _wantsPlay = false; // user intent; playback may wait for analysis
-  bool _waitingForAnalysis = false;
+  bool _wantsPlay = false;
   String? _videoError;
 
   // Playback clock: video_player only reports position every ~500ms, so we
@@ -161,9 +160,9 @@ class _UploadScreenState extends State<UploadScreen>
     _video?.dispose();
     _video = null;
     _track = VideoDetectionTrack(sampleIntervalMs: _sampleIntervalMs);
+    _defects = DefectTracks.empty;
     _videoBoxes.value = const [];
     _wantsPlay = false;
-    _waitingForAnalysis = false;
     _videoError = null;
   }
 
@@ -199,6 +198,7 @@ class _UploadScreenState extends State<UploadScreen>
     if (file == null || bytes == null) return;
 
     _track = VideoDetectionTrack(sampleIntervalMs: _sampleIntervalMs);
+    _defects = DefectTracks.empty;
     _videoBoxes.value = const [];
     _videoError = null;
     setState(() => _analyzing = true);
@@ -224,15 +224,38 @@ class _UploadScreenState extends State<UploadScreen>
               if (_track.sampleCount % 5 == 0) setState(() {});
             case VideoAnalysisDone():
               _track.complete = true;
-              setState(() => _analyzing = false);
-              _maybeResume();
+              _finishScan(play: true);
             case VideoAnalysisError():
-              setState(() {
-                _analyzing = false;
-                _videoError = event.message;
-              });
+              _videoError = event.message;
+              _finishScan(play: false);
           }
         });
+  }
+
+  /// Whole video scanned (or scan stopped): link detections into stable
+  /// tracks, then play from the start with the boxes.
+  void _finishScan({required bool play}) {
+    _analysisSub?.cancel();
+    _analysisSub = null;
+    _analysis.stop();
+    final defects = DefectTracks.build(_track.samples);
+    if (!kReleaseMode) {
+      debugPrint(
+        "🎞️ scan: ${_track.sampleCount} frames, ${defects.count} defects",
+      );
+    }
+    setState(() {
+      _analyzing = false;
+      _defects = defects;
+    });
+    final c = _video;
+    if (play && c != null) {
+      c.seekTo(Duration.zero).then((_) {
+        if (!mounted) return;
+        setState(() => _wantsPlay = true);
+        c.play();
+      });
+    }
   }
 
   void _stopAnalysis() {
@@ -258,12 +281,6 @@ class _UploadScreenState extends State<UploadScreen>
   // ───────── VIDEO: PLAYBACK SYNC ─────────
 
   int get _durationMs => _video?.value.duration.inMilliseconds ?? 0;
-
-  /// Playback has reached the edge of what has been analysed.
-  bool _needsAnalysisAt(int posMs) {
-    if (_track.complete || !_analyzing) return false;
-    return posMs > _track.analyzedUntilMs;
-  }
 
   void _onVideoValue() {
     final v = _video?.value;
@@ -313,42 +330,24 @@ class _UploadScreenState extends State<UploadScreen>
     final dur = _durationMs;
     if (dur > 0 && pos > dur) pos = dur;
 
-    // Never play past the analysed region: pause and wait instead of
-    // showing frames with no (or stale) boxes.
-    if (v.isPlaying && _needsAnalysisAt(pos)) {
-      c.pause();
-      setState(() => _waitingForAnalysis = true);
-    } else if (_waitingForAnalysis) {
-      _maybeResume();
-    }
-
-    final boxes = _track.at(pos);
+    // Everything is scanned before playback, so boxes are a lookup.
+    final boxes = _analyzing ? const <Detection>[] : _defects.at(pos);
     if (!identical(boxes, _videoBoxes.value)) _videoBoxes.value = boxes;
-  }
-
-  void _maybeResume() {
-    final c = _video;
-    if (c == null || !_wantsPlay || c.value.isPlaying) return;
-    final pos = c.value.position.inMilliseconds;
-    final ready =
-        _track.complete ||
-        !_analyzing ||
-        _track.analyzedUntilMs >= pos + _resumeAheadMs ||
-        (_durationMs > 0 && _track.analyzedUntilMs >= _durationMs - 50);
-    if (ready) {
-      setState(() => _waitingForAnalysis = false);
-      c.play();
-    }
   }
 
   Future<void> _togglePlay() async {
     final c = _video;
     if (c == null) return;
+    if (_analyzing) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Scanning the video… it plays when the scan is done"),
+        ),
+      );
+      return;
+    }
     if (_wantsPlay) {
-      setState(() {
-        _wantsPlay = false;
-        _waitingForAnalysis = false;
-      });
+      setState(() => _wantsPlay = false);
       await c.pause();
       return;
     }
@@ -357,11 +356,7 @@ class _UploadScreenState extends State<UploadScreen>
       await c.seekTo(Duration.zero);
     }
     setState(() => _wantsPlay = true);
-    if (_needsAnalysisAt(c.value.position.inMilliseconds)) {
-      setState(() => _waitingForAnalysis = true);
-    } else {
-      await c.play();
-    }
+    await c.play();
   }
 
   // ───────── DETECT BUTTON ─────────
@@ -380,22 +375,15 @@ class _UploadScreenState extends State<UploadScreen>
       final c = _video;
       if (c == null) return;
       if (_analyzing) {
-        // STOP DETECTION
-        _stopAnalysis();
-        setState(() {
-          _wantsPlay = false;
-          _waitingForAnalysis = false;
-        });
-        await c.pause();
+        // STOP DETECTION: keep what was scanned so far, do not auto-play.
+        _finishScan(play: false);
       } else {
-        // START DETECTION: analyse from the start, play as results arrive.
+        // START DETECTION: scan the whole video first (paused), like a
+        // photo; playback with boxes starts automatically when done.
         await c.pause();
         await c.seekTo(Duration.zero);
+        setState(() => _wantsPlay = false);
         _startAnalysis();
-        setState(() {
-          _wantsPlay = true;
-          _waitingForAnalysis = true;
-        });
       }
     } else {
       await _detectImage();
@@ -516,9 +504,7 @@ class _UploadScreenState extends State<UploadScreen>
                     return Stack(
                       clipBehavior: Clip.none,
                       children: [
-                        for (final det in boxes)
-                          if (det.confidence >= 0.25)
-                            _videoBox(det, size, scale),
+                        for (final det in boxes) _videoBox(det, size, scale),
                       ],
                     );
                   },
@@ -533,7 +519,7 @@ class _UploadScreenState extends State<UploadScreen>
 
   Widget _videoBox(Detection det, Size size, double scale) {
     final b = det.boundingBox;
-    final color = _boxColor(det.confidence);
+    const color = Color(0xFFFF3B30); // red, as in the reference output
     return Positioned(
       left: b.left * size.width,
       top: b.top * size.height,
@@ -544,24 +530,24 @@ class _UploadScreenState extends State<UploadScreen>
         children: [
           Container(
             decoration: BoxDecoration(
-              border: Border.all(color: color, width: 2 * scale),
+              border: Border.all(color: color, width: 1.5 * scale),
             ),
           ),
           Positioned(
-            top: -20 * scale,
+            top: -15 * scale,
             left: 0,
             child: Container(
               padding: EdgeInsets.symmetric(
-                horizontal: 6 * scale,
-                vertical: 2 * scale,
+                horizontal: 3 * scale,
+                vertical: 1 * scale,
               ),
               color: color,
               child: Text(
-                "${det.label} ${(det.confidence * 100).toStringAsFixed(1)}%",
+                "${det.label.toLowerCase()} ${det.confidence.toStringAsFixed(2)}",
                 style: TextStyle(
-                  fontSize: 11 * scale,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.black,
+                  fontSize: 9 * scale,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
                 ),
               ),
             ),
@@ -570,6 +556,9 @@ class _UploadScreenState extends State<UploadScreen>
       ),
     );
   }
+
+  String _defectCountText() =>
+      _defects.count == 1 ? "1 defect" : "${_defects.count} defects";
 
   Widget _buildVideoStatus() {
     final c = _video;
@@ -585,14 +574,12 @@ class _UploadScreenState extends State<UploadScreen>
     if (_videoError != null) {
       status = _videoError!;
     } else if (_analyzing) {
-      status = _waitingForAnalysis
-          ? "Buffering detections… ${(progress * 100).toStringAsFixed(0)}%"
-          : "Detecting in real time… ${(progress * 100).toStringAsFixed(0)}%";
+      status = "Scanning video… ${(progress * 100).toStringAsFixed(0)}%";
     } else if (_track.complete) {
-      status =
-          "Detection complete · defects in ${_track.framesWithDefects} of ${_track.sampleCount} detected frames";
+      status = "Scan complete · ${_defectCountText()} found";
     } else if (_track.sampleCount > 0) {
-      status = "Detection stopped at ${(progress * 100).toStringAsFixed(0)}%";
+      status =
+          "Scan stopped at ${(progress * 100).toStringAsFixed(0)}% · ${_defectCountText()} found so far";
     } else {
       status = "Press START DETECTION to detect defects";
     }
@@ -642,7 +629,7 @@ class _UploadScreenState extends State<UploadScreen>
                   ),
                 ),
               ),
-              if (_waitingForAnalysis && _wantsPlay)
+              if (_analyzing)
                 const SizedBox(
                   width: 16,
                   height: 16,
