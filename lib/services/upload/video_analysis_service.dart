@@ -1,14 +1,15 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
-import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 import '../../models/detection.dart';
 import '../../utils/preprocessing.dart';
 import '../detector/detector_client.dart';
+import 'hw_video_decoder.dart';
 
 /// Events emitted while a video is processed.
 sealed class VideoAnalysisEvent {
@@ -51,10 +52,13 @@ class VideoAnalysisError extends VideoAnalysisEvent {
 /// as fast as the phone allows, while the screen plays the video.
 ///
 /// Two isolates run in parallel:
-/// * **decoder** – `cap.grab()`s every frame (decode only) and `cap.read()`s
-///   the frames picked for detection, resizes them natively and hands them
-///   to the detector. It never runs more than one sample ahead of the
-///   detector, so detection keeps pace with decoding.
+/// * **decoder** – decodes every frame and hands the frames picked for
+///   detection, downscaled to the model size, to the detector. On Android it
+///   uses [HwVideoDecoder] (MediaCodec into the GPU, which downscales there,
+///   so 4K frames never reach the CPU); elsewhere, or if that fails to open,
+///   OpenCV/FFmpeg `cap.grab()`s every frame and `cap.read()`s the sampled
+///   ones. It never runs more than one sample ahead of the detector, so
+///   detection keeps pace with decoding.
 /// * **detector** – runs the model and emits timestamped boxes.
 ///
 /// The spacing between detected frames adapts to the measured inference
@@ -77,16 +81,22 @@ class VideoAnalysisService {
 
   /// [expectPortrait] is the orientation the player shows (from
   /// `VideoPlayerController.value.size`); decoded frames are rotated to
-  /// match it so boxes line up. [preferHardware] decodes with Android's
-  /// MediaCodec instead of FFmpeg in software.
+  /// match it so boxes line up. [gpuDecode] decodes with [HwVideoDecoder]
+  /// on Android (FFmpeg is the fallback); [preferHardware] picks OpenCV's
+  /// MediaCodec backend for the FFmpeg-path fallback.
   Stream<VideoAnalysisEvent> start(
     String videoPath,
     Uint8List modelBytes, {
     bool? expectPortrait,
+    bool gpuDecode = true,
     bool preferHardware = false,
     SendPort? gpu,
   }) {
     stop();
+    // Lets the decoder isolate use platform channels (hardware decoder).
+    final rootToken = gpuDecode && Platform.isAndroid
+        ? RootIsolateToken.instance
+        : null;
     final controller = StreamController<VideoAnalysisEvent>();
     final events = ReceivePort();
     _controller = controller;
@@ -113,6 +123,7 @@ class VideoAnalysisService {
                   maxIntervalMs,
                   expectPortrait,
                   preferHardware,
+                  rootToken,
                 ])
                 .then((iso) {
                   if (_events == events) {
@@ -275,19 +286,20 @@ class VideoAnalysisService {
           if (!kReleaseMode) debugPrint('🎞️ video detector switched to GPU');
           continue;
         }
-        // ['job', ts, frameW, frameH, pixels]
+        // ['job', ts, frameW, frameH, pixels, bgr]
         final int ts = msg[1];
         final int w = msg[2];
         final int h = msg[3];
         final Uint8List pixels = (msg[4] as TransferableTypedData)
             .materialize()
             .asUint8List();
+        final bool bgr = msg.length > 5 ? msg[5] as bool : true;
         final sw = Stopwatch()..start();
         List<Detection> dets = const [];
         try {
           final lb = LetterboxInfo.forSize(w, h);
           dets = _normalize(
-            await client.detectPacked(pixels, lb, bgr: true),
+            await client.detectPacked(pixels, lb, bgr: bgr),
             lb,
             w,
             h,
@@ -344,6 +356,7 @@ class VideoAnalysisService {
     final int maxInterval = args[4];
     final bool? expectPortrait = args[5];
     final bool preferHardware = args[6];
+    final RootIsolateToken? rootToken = args[7];
 
     final control = ReceivePort();
     main.send(['decoder', control.sendPort]);
@@ -362,8 +375,93 @@ class VideoAnalysisService {
       }
     });
 
+    int nextInterval() => (inferMsEma * 1.15)
+        .clamp(minInterval.toDouble(), maxInterval.toDouble())
+        .round();
+
+    /// Decodes with [HwVideoDecoder]. Returns false (nothing sent yet) when
+    /// it is unavailable, so the FFmpeg path can take over.
+    Future<bool> decodeOnGpu() async {
+      if (rootToken == null) return false;
+      BackgroundIsolateBinaryMessenger.ensureInitialized(rootToken);
+      final hw = await HwVideoDecoder.open(
+        path,
+        expectPortrait: expectPortrait,
+      );
+      if (hw == null) return false;
+      try {
+        final int w = hw.width;
+        final int h = hw.height;
+        final double fps = hw.frameRate > 0 ? hw.frameRate : 30.0;
+        final double frameMs = 1000.0 / fps;
+        final lb = LetterboxInfo.forSize(w, h);
+        final wall = Stopwatch()..start();
+
+        HwVideoFrame? frame;
+        try {
+          frame = await hw.next(0, lb.newWidth, lb.newHeight);
+        } on PlatformException catch (e) {
+          if (!kReleaseMode) debugPrint('🎞️ hardware decode failed: $e');
+          return false; // nothing sent yet: fall back to FFmpeg
+        }
+        main.send(VideoAnalysisInfo(w, h, fps, hw.durationMs));
+        if (!kReleaseMode) {
+          debugPrint(
+            '🎞️ video opened ${w}x$h @ ${fps.toStringAsFixed(1)} fps, '
+            'hardware ${hw.codec}, rotate ${hw.rotation} (tag ${hw.meta}), '
+            'BT.601 ${hw.yuv601}',
+          );
+        }
+
+        int lastTs = -1;
+        int samples = 0;
+        while (frame != null && !cancelled) {
+          // Hand over at most one frame at a time: wait for the detector.
+          await detectorFree.future;
+          if (cancelled) break;
+          int ts = (frame.timestampUs / 1000).round();
+          if (ts <= lastTs) ts = lastTs + 1;
+          lastTs = ts;
+          samples++;
+          detectorFree = Completer<void>();
+          detector.send([
+            'job',
+            ts,
+            w,
+            h,
+            TransferableTypedData.fromList([frame.rgb]),
+            false,
+          ]);
+          // Space detections by what the phone can sustain in real time,
+          // and decode up to the next sample while the detector works.
+          final nextSampleMs = lastTs + nextInterval();
+          frame = await hw.next(
+            ((nextSampleMs - frameMs / 2) * 1000).round(),
+            lb.newWidth,
+            lb.newHeight,
+          );
+          if (!kReleaseMode && samples % 50 == 0) {
+            final secs = wall.elapsedMilliseconds / 1000;
+            debugPrint(
+              '🎞️ hw decoder: video ${(lastTs / 1000).toStringAsFixed(1)}s '
+              'in ${secs.toStringAsFixed(1)}s, $samples samples, '
+              'inference ~${inferMsEma.round()}ms',
+            );
+          }
+        }
+        // Wait for the last frame's detections before reporting completion.
+        await detectorFree.future;
+        if (!cancelled) main.send(VideoAnalysisDone(lastTs));
+        return true;
+      } finally {
+        await hw.close();
+      }
+    }
+
     cv.VideoCapture? cap;
     try {
+      if (await decodeOnGpu()) return;
+      if (cancelled) return;
       final opened = openForDecoding(path, preferHardware: preferHardware);
       if (opened == null) {
         main.send(const VideoAnalysisError('Could not open video'));
@@ -470,10 +568,7 @@ class VideoAnalysisService {
           detector.send(['job', lastTs, w, h, pixels]);
 
           // Space detections by what the phone can sustain in real time.
-          final interval = (inferMsEma * 1.15)
-              .clamp(minInterval.toDouble(), maxInterval.toDouble())
-              .round();
-          nextSampleMs = lastTs + interval;
+          nextSampleMs = lastTs + nextInterval();
         }
 
         if (frameIndex % 8 == 0) {
