@@ -8,7 +8,7 @@ import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 import '../../models/detection.dart';
 import '../../utils/preprocessing.dart';
-import '../model_service.dart';
+import '../detector/detector_client.dart';
 
 /// Events emitted while a video is processed.
 sealed class VideoAnalysisEvent {
@@ -64,7 +64,7 @@ class VideoAnalysisService {
   final int minIntervalMs;
   final int maxIntervalMs;
 
-  VideoAnalysisService({this.minIntervalMs = 200, this.maxIntervalMs = 500});
+  VideoAnalysisService({this.minIntervalMs = 100, this.maxIntervalMs = 500});
 
   Isolate? _decoder;
   Isolate? _detector;
@@ -84,6 +84,7 @@ class VideoAnalysisService {
     Uint8List modelBytes, {
     bool? expectPortrait,
     bool preferHardware = false,
+    SendPort? gpu,
   }) {
     stop();
     final controller = StreamController<VideoAnalysisEvent>();
@@ -134,7 +135,7 @@ class VideoAnalysisService {
       }
     });
 
-    Isolate.spawn(_detectorEntry, [events.sendPort, modelBytes])
+    Isolate.spawn(_detectorEntry, [events.sendPort, modelBytes, gpu])
         .then((iso) {
           if (_events == events) {
             _detector = iso;
@@ -151,6 +152,9 @@ class VideoAnalysisService {
 
   /// Stops processing. Workers release the decoder and model themselves and
   /// are force-killed if they do not exit promptly.
+  /// Switches a running detection to the GPU engine once it is ready.
+  void useGpu(SendPort gpu) => _detectorPort?.send(['gpu', gpu]);
+
   void stop() {
     _decoderPort?.send('cancel');
     _detectorPort?.send('exit');
@@ -178,19 +182,22 @@ class VideoAnalysisService {
   static Future<void> _detectorEntry(List<dynamic> args) async {
     final SendPort main = args[0];
     final Uint8List modelBytes = args[1];
+    final SendPort? gpu = args[2];
     final port = ReceivePort();
     main.send(['detector', port.sendPort]);
 
-    final ModelService model;
-    try {
-      model = ModelService.withSession(
-        await ModelService.createSession(modelBytes),
-      );
-    } catch (e) {
-      main.send(VideoAnalysisError('Model failed to load: $e'));
-      port.close();
-      return;
+    // GPU engine when available; CPU session (in this isolate) otherwise.
+    final client = DetectorClient(modelBytes, gpu: gpu);
+    if (gpu == null) {
+      try {
+        await client.ensureCpu();
+      } catch (e) {
+        main.send(VideoAnalysisError('Model failed to load: $e'));
+        port.close();
+        return;
+      }
     }
+    if (!kReleaseMode) debugPrint('🎞️ video detector on ${client.engine}');
     main.send(['detector-ready']);
 
     SendPort? decoder;
@@ -200,6 +207,11 @@ class VideoAnalysisService {
         if (msg is! List) continue;
         if (msg[0] == 'hello') {
           decoder = msg[1] as SendPort;
+          continue;
+        }
+        if (msg[0] == 'gpu') {
+          client.gpu = msg[1] as SendPort;
+          if (!kReleaseMode) debugPrint('🎞️ video detector switched to GPU');
           continue;
         }
         // ['job', ts, frameW, frameH, pixels]
@@ -213,26 +225,27 @@ class VideoAnalysisService {
         List<Detection> dets = const [];
         try {
           final lb = LetterboxInfo.forSize(w, h);
-          final input = tensorFromPacked(
-            pixels,
-            lb.newWidth,
-            lb.newHeight,
+          dets = _normalize(
+            await client.detectPacked(pixels, lb, bgr: true),
             lb,
-            bgr: true,
+            w,
+            h,
           );
-          dets = _normalize(model.detectTensor(input), lb, w, h);
         } catch (e) {
           main.send(VideoAnalysisError('Detection failed: $e'));
         }
         final ms = sw.elapsedMilliseconds;
         if (!kReleaseMode) {
-          debugPrint('🎞️ video ${ts}ms: ${dets.length} detections (${ms}ms)');
+          debugPrint(
+            '🎞️ video ${ts}ms: ${dets.length} detections '
+            '(${ms}ms, ${client.engine})',
+          );
         }
         main.send(VideoFrameDetections(ts, dets));
         decoder?.send(['free', ms]);
       }
     } finally {
-      model.release();
+      client.release();
       port.close();
     }
   }

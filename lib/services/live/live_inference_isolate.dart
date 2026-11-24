@@ -5,7 +5,7 @@ import 'dart:ui';
 import 'package:flutter/foundation.dart';
 
 import '../../models/detection.dart';
-import '../model_service.dart';
+import '../detector/detector_client.dart';
 import 'live_frame.dart';
 import 'live_preprocess.dart';
 
@@ -15,7 +15,10 @@ class LiveResult {
   final List<Detection> detections;
   final int inferenceMs;
 
-  const LiveResult(this.detections, this.inferenceMs);
+  /// 'GPU' or 'CPU': which engine produced this result.
+  final String engine;
+
+  const LiveResult(this.detections, this.inferenceMs, this.engine);
 }
 
 /// Background inference for the **live camera** pipeline only.
@@ -28,9 +31,14 @@ class LiveInferenceIsolate {
 
   bool get isReady => _sendPort != null;
 
-  Future<void> start(Uint8List modelBytes) async {
+  /// [gpu] is the shared GPU engine's port, if it is ready.
+  Future<void> start(Uint8List modelBytes, {SendPort? gpu}) async {
     final receivePort = ReceivePort();
-    _isolate = await Isolate.spawn(_entry, [receivePort.sendPort, modelBytes]);
+    _isolate = await Isolate.spawn(_entry, [
+      receivePort.sendPort,
+      modelBytes,
+      gpu,
+    ]);
 
     final completer = Completer<void>();
     SendPort? workerPort;
@@ -63,6 +71,9 @@ class LiveInferenceIsolate {
     return result as LiveResult;
   }
 
+  /// Switches live detection to the GPU engine once it becomes ready.
+  void useGpu(SendPort gpu) => _sendPort?.send(['gpu', gpu]);
+
   void dispose() {
     _isolate?.kill(priority: Isolate.immediate);
     _isolate = null;
@@ -72,33 +83,43 @@ class LiveInferenceIsolate {
   static Future<void> _entry(List<dynamic> args) async {
     final SendPort main = args[0];
     final Uint8List modelBytes = args[1];
+    final SendPort? gpu = args[2];
 
     final port = ReceivePort();
     main.send(port.sendPort);
 
-    final ModelService model;
-    try {
-      model = ModelService.withSession(
-        await ModelService.createSession(modelBytes),
-      );
-    } catch (e) {
-      main.send('Live model init failed: $e');
-      return;
+    // GPU engine when available; CPU session (in this isolate) otherwise.
+    final client = DetectorClient(modelBytes, gpu: gpu);
+    if (gpu == null) {
+      try {
+        await client.ensureCpu();
+      } catch (e) {
+        main.send('Live model init failed: $e');
+        return;
+      }
     }
     main.send('ready');
 
     await for (final message in port) {
+      if (message is List && message[0] == 'gpu') {
+        client.gpu = message[1] as SendPort;
+        continue;
+      }
       final LiveFrame frame = message[0];
       final SendPort reply = message[1];
       final sw = Stopwatch()..start();
       try {
-        final pre = preprocessLiveFrame(frame);
+        final pre = packLiveFrame(frame);
         final preMs = sw.elapsedMilliseconds;
-        final raw = model.detectTensor(pre.input);
+        final raw = await client.detectPacked(
+          pre.rgb,
+          pre.letterbox,
+          bgr: false,
+        );
         if (!kReleaseMode) {
           debugPrint(
             '📷 live worker: preprocess ${preMs}ms, '
-            'model ${sw.elapsedMilliseconds - preMs}ms',
+            'model ${sw.elapsedMilliseconds - preMs}ms (${client.engine})',
           );
         }
         final w = pre.uprightWidth.toDouble();
@@ -122,7 +143,9 @@ class LiveInferenceIsolate {
             ),
           );
         }
-        reply.send(LiveResult(normalized, sw.elapsedMilliseconds));
+        reply.send(
+          LiveResult(normalized, sw.elapsedMilliseconds, client.engine),
+        );
       } catch (e) {
         reply.send('Live inference error: $e');
       }

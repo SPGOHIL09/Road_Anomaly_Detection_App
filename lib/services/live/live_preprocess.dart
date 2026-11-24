@@ -3,6 +3,22 @@ import 'dart:typed_data';
 import '../../utils/preprocessing.dart';
 import 'live_frame.dart';
 
+/// A camera frame converted to upright, letterbox-resized RGB pixels
+/// (tightly packed newWidth x newHeight x 3), ready for either engine.
+class LivePackedFrame {
+  final Uint8List rgb;
+  final LetterboxInfo letterbox;
+  final int uprightWidth;
+  final int uprightHeight;
+
+  const LivePackedFrame(
+    this.rgb,
+    this.letterbox,
+    this.uprightWidth,
+    this.uprightHeight,
+  );
+}
+
 class LivePreprocessResult {
   final Float32List input;
   final LetterboxInfo letterbox;
@@ -18,20 +34,28 @@ class LivePreprocessResult {
 }
 
 /// Converts a raw camera buffer straight into the letterboxed 640x640 CHW
-/// model tensor in a single pass: colour conversion, rotation, mirroring and
+/// model tensor (ONNX / CPU layout). See [packLiveFrame].
+LivePreprocessResult preprocessLiveFrame(LiveFrame f) {
+  final p = packLiveFrame(f);
+  final lb = p.letterbox;
+  return LivePreprocessResult(
+    tensorFromPacked(p.rgb, lb.newWidth, lb.newHeight, lb),
+    lb,
+    p.uprightWidth,
+    p.uprightHeight,
+  );
+}
+
+/// Converts a raw camera buffer into upright, letterbox-resized RGB pixels
+/// in a single pass: colour conversion, rotation, mirroring and
 /// nearest-neighbour resize are fused, and only the ~300k destination pixels
 /// are ever computed (the prototype converted every sensor pixel first, then
 /// resized again).
-LivePreprocessResult preprocessLiveFrame(LiveFrame f) {
-  const int size = kModelInputSize;
-  const int plane = size * size;
-  const double pad = kLetterboxPadValue / 255.0;
-
+LivePackedFrame packLiveFrame(LiveFrame f) {
   final int uw = f.uprightWidth;
   final int uh = f.uprightHeight;
   final lb = LetterboxInfo.forSize(uw, uh);
-  final Float32List input = Float32List(3 * plane)
-    ..fillRange(0, 3 * plane, pad);
+  final Uint8List out = Uint8List(lb.newWidth * lb.newHeight * 3);
 
   // Nearest-neighbour lookup tables from destination to upright coordinates.
   final Int32List ux = Int32List(lb.newWidth);
@@ -54,7 +78,7 @@ LivePreprocessResult preprocessLiveFrame(LiveFrame f) {
   for (int dy = 0; dy < lb.newHeight; dy++) {
     int uy = ((dy + 0.5) / lb.scale).floor();
     if (uy >= uh) uy = uh - 1;
-    final int dstRow = (dy + lb.yOffset) * size + lb.xOffset;
+    final int dstRow = dy * lb.newWidth;
 
     for (int dx = 0; dx < lb.newWidth; dx++) {
       final int x = ux[dx];
@@ -110,12 +134,12 @@ LivePreprocessResult preprocessLiveFrame(LiveFrame f) {
         b = b < 0 ? 0 : (b > 255 ? 255 : b);
       }
 
-      final int di = dstRow + dx;
-      input[di] = r / 255.0;
-      input[di + plane] = g / 255.0;
-      input[di + 2 * plane] = b / 255.0;
+      final int di = (dstRow + dx) * 3;
+      out[di] = r;
+      out[di + 1] = g;
+      out[di + 2] = b;
     }
   }
 
-  return LivePreprocessResult(input, lb, uw, uh);
+  return LivePackedFrame(out, lb, uw, uh);
 }

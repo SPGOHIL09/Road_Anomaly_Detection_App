@@ -11,6 +11,7 @@ import 'package:road_anomaly_detector/theme/app_theme.dart';
 import 'package:road_anomaly_detector/services/model_service.dart';
 import 'package:road_anomaly_detector/models/detection.dart';
 import 'package:road_anomaly_detector/services/inference_isolate.dart';
+import 'package:road_anomaly_detector/services/detector/gpu_detector_service.dart';
 import 'package:road_anomaly_detector/services/upload/video_analysis_service.dart';
 import 'package:road_anomaly_detector/services/upload/video_detection_track.dart';
 
@@ -41,7 +42,7 @@ class _UploadScreenState extends State<UploadScreen>
   // ───── Video state ─────
   /// Detection spacing adapts between these (video time) to the phone's
   /// inference speed; the track tolerates gaps up to the maximum.
-  static const int _minDetectIntervalMs = 200;
+  static const int _minDetectIntervalMs = 100;
   static const int _sampleIntervalMs = 500;
 
   /// Playback starts (or resumes) once detections cover this much video
@@ -82,12 +83,26 @@ class _UploadScreenState extends State<UploadScreen>
   Future<void> _initIsolate() async {
     final modelBytes = await ModelService.loadModelBytes();
     _modelBytes = modelBytes;
-    await _isolate.start(modelBytes);
+    await _isolate.start(modelBytes, gpu: GpuDetectorService.port);
+    if (GpuDetectorService.port == null) {
+      GpuDetectorService.portListenable.addListener(_onGpuReady);
+    }
     if (mounted) setState(() => _isIsolateReady = true);
+  }
+
+  /// The shared GPU engine finished starting: move this screen's photo and
+  /// video detection onto it.
+  void _onGpuReady() {
+    final gpu = GpuDetectorService.port;
+    if (gpu == null || !mounted) return;
+    GpuDetectorService.portListenable.removeListener(_onGpuReady);
+    _isolate.useGpu(gpu);
+    _analysis.useGpu(gpu);
   }
 
   @override
   void dispose() {
+    GpuDetectorService.portListenable.removeListener(_onGpuReady);
     _ticker.dispose();
     _stopAnalysis();
     _video?.dispose();
@@ -196,6 +211,7 @@ class _UploadScreenState extends State<UploadScreen>
           expectPortrait: shown == null || shown.isEmpty
               ? null
               : shown.height > shown.width,
+          gpu: GpuDetectorService.port,
         )
         .listen((event) {
           if (!mounted) return;

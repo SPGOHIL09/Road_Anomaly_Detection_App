@@ -1,10 +1,12 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:image/image.dart' as img;
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 import '../../models/detection.dart';
 import '../../utils/preprocessing.dart';
+import '../detector/detector_client.dart';
 import '../model_service.dart';
 
 /// Detections for a photo. Boxes are in the pixel space of [width] x
@@ -28,12 +30,17 @@ class ImageDetectionResult {
 /// Formats OpenCV cannot read fall back to the prototype's Dart decoder.
 Future<ImageDetectionResult> detectImagePath(
   ModelService model,
+  DetectorClient client,
   String path,
 ) async {
-  return _detectWithOpenCV(model, path) ?? await _detectWithDart(model, path);
+  return await _detectWithOpenCV(client, path) ??
+      await _detectWithDart(model, path);
 }
 
-ImageDetectionResult? _detectWithOpenCV(ModelService model, String path) {
+Future<ImageDetectionResult?> _detectWithOpenCV(
+  DetectorClient client,
+  String path,
+) async {
   // JPEG can decode straight to 1/4 size (12 MP -> ~1020x768 in ~40 ms
   // instead of ~115 ms); that is still larger than the 640 model input.
   cv.Mat mat = cv.imread(path, flags: cv.IMREAD_REDUCED_COLOR_4);
@@ -51,17 +58,12 @@ ImageDetectionResult? _detectWithOpenCV(ModelService model, String path) {
       lb.newWidth,
       lb.newHeight,
     ), interpolation: cv.INTER_AREA);
-    final input = tensorFromPacked(
-      resized.data,
-      lb.newWidth,
-      lb.newHeight,
-      lb,
-      bgr: true,
-    );
+    // Copy out of native memory before the Mat is freed.
+    final packed = Uint8List.fromList(resized.data);
     resized.dispose();
 
     final detections = [
-      for (final d in model.detectTensor(input))
+      for (final d in await client.detectPacked(packed, lb, bgr: true))
         Detection(
           label: d.label,
           confidence: d.confidence,

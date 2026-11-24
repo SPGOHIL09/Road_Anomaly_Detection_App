@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import '../services/live/detection_tracker.dart';
 import '../services/live/live_frame.dart';
 import '../services/live/live_inference_isolate.dart';
+import '../services/detector/gpu_detector_service.dart';
 import '../services/model_service.dart';
 import '../models/detection.dart';
 import '../theme/app_theme.dart';
@@ -38,11 +39,15 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   String? _error;
 
   double _fps = 0;
-  double _cpu = 12;
+
+  /// Which engine ran the last detection ('GPU' or 'CPU').
+  String _engine = '—';
 
   DateTime _lastInference = DateTime.now();
   DateTime? _lastResultAt;
-  final Duration _inferenceInterval = const Duration(milliseconds: 120);
+
+  /// Minimum gap between frames sent for detection (GPU ~50 ms per frame).
+  final Duration _inferenceInterval = const Duration(milliseconds: 66);
 
   /// Incremented when detection stops so late results are discarded.
   int _session = 0;
@@ -61,7 +66,10 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
   Future<void> _initIsolate() async {
     try {
       final modelBytes = await ModelService.loadModelBytes();
-      await _inferenceIsolate.start(modelBytes);
+      await _inferenceIsolate.start(modelBytes, gpu: GpuDetectorService.port);
+      if (GpuDetectorService.port == null) {
+        GpuDetectorService.portListenable.addListener(_onGpuReady);
+      }
       _isIsolateReady = true;
       debugPrint("Live isolate ready");
     } catch (e) {
@@ -70,8 +78,17 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
     }
   }
 
+  /// The shared GPU engine finished starting: move live detection onto it.
+  void _onGpuReady() {
+    final gpu = GpuDetectorService.port;
+    if (gpu == null || _disposed) return;
+    GpuDetectorService.portListenable.removeListener(_onGpuReady);
+    _inferenceIsolate.useGpu(gpu);
+  }
+
   @override
   void dispose() {
+    GpuDetectorService.portListenable.removeListener(_onGpuReady);
     _disposed = true;
     final controller = _cameraController;
     _cameraController = null;
@@ -170,7 +187,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
           if (!kReleaseMode) {
             debugPrint(
               "📷 live: ${result.detections.length} detections "
-              "(${result.inferenceMs}ms)",
+              "(${result.inferenceMs}ms, ${result.engine})",
             );
           }
           final smoothed = _tracker.update(result.detections);
@@ -178,6 +195,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
           final last = _lastResultAt;
           _lastResultAt = at;
           setState(() {
+            _engine = result.engine;
             _detections = smoothed;
             if (last != null) {
               final instant =
@@ -337,7 +355,7 @@ class _LiveDetectionScreenState extends State<LiveDetectionScreen> {
         children: [
           _statCard("FPS", _fps.toStringAsFixed(1)),
           const SizedBox(height: 12),
-          _statCard("CPU", "${_cpu.toStringAsFixed(0)}%"),
+          _statCard("ENGINE", _engine),
         ],
       ),
     );

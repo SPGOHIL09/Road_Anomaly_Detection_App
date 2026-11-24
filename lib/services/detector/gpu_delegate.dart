@@ -87,9 +87,13 @@ class CachedGpuDelegate implements Delegate {
     opts.ref = _defaults();
     opts.ref
       ..isPrecisionLossAllowed = fp16 ? 1 : 0
-      ..inferencePreference = 1 // SUSTAINED_SPEED
-      ..inferencePriority1 = fp16 ? 2 : 1 // MIN_LATENCY : MAX_PRECISION
-      ..inferencePriority2 = 0 // AUTO
+      ..inferencePreference =
+          1 // SUSTAINED_SPEED
+      ..inferencePriority1 = fp16
+          ? 2
+          : 1 // MIN_LATENCY : MAX_PRECISION
+      ..inferencePriority2 =
+          0 // AUTO
       ..inferencePriority3 = 0; // AUTO
     Pointer<Utf8> dir = nullptr, token = nullptr;
     if (cacheDir != null && modelToken != null) {
