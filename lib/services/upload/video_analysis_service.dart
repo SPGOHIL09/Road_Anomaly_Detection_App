@@ -177,6 +177,67 @@ class VideoAnalysisService {
     if (c != null && !c.isClosed) c.close();
   }
 
+  /// Opens [path] for frame-by-frame decoding.
+  ///
+  /// With [preferHardware] on Android, frames are decoded by MediaCodec
+  /// (OpenCV's Android backend). On a Pixel 9 it was not reliably faster
+  /// than FFmpeg for 4K HEVC (18.8-26.3 fps vs 22-24 fps across runs), so
+  /// it is off by default. That backend reports neither the rotation tag
+  /// nor the frame count, so both (and fps) come from a quick FFmpeg probe
+  /// and frames are rotated exactly as FFmpeg's auto-rotation would.
+  static OpenedVideo? openForDecoding(
+    String path, {
+    bool preferHardware = false,
+  }) {
+    final probe = cv.VideoCapture.fromFile(path, apiPreference: cv.CAP_FFMPEG);
+    if (!probe.isOpened) {
+      probe.release();
+      final any = cv.VideoCapture.fromFile(path);
+      if (!any.isOpened) {
+        any.release();
+        return null;
+      }
+      return OpenedVideo(
+        any,
+        false,
+        any.get(cv.CAP_PROP_FPS),
+        any.get(cv.CAP_PROP_FRAME_COUNT),
+        0,
+        null,
+      );
+    }
+    final fps = probe.get(cv.CAP_PROP_FPS);
+    final count = probe.get(cv.CAP_PROP_FRAME_COUNT);
+    final meta = probe.get(cv.CAP_PROP_ORIENTATION_META).round() % 360;
+    final ffmpegAutoRotates = probe.get(cv.CAP_PROP_ORIENTATION_AUTO) != 0;
+
+    if (preferHardware && Platform.isAndroid) {
+      final hw = cv.VideoCapture.fromFile(path, apiPreference: cv.CAP_ANDROID);
+      if (hw.isOpened) {
+        probe.release();
+        return OpenedVideo(hw, true, fps, count, meta, rotationFor(meta));
+      }
+      hw.release();
+    }
+    return OpenedVideo(
+      probe,
+      false,
+      fps,
+      count,
+      meta,
+      ffmpegAutoRotates ? null : rotationFor(meta),
+    );
+  }
+
+  /// OpenCV rotate code for a container rotation tag (same mapping as
+  /// OpenCV's FFmpeg auto-rotation).
+  static int? rotationFor(int meta) => switch (meta) {
+    90 => cv.ROTATE_90_CLOCKWISE,
+    180 => cv.ROTATE_180,
+    270 => cv.ROTATE_90_COUNTERCLOCKWISE,
+    _ => null,
+  };
+
   // ─────────────────────── Detector isolate ───────────────────────
 
   static Future<void> _detectorEntry(List<dynamic> args) async {
@@ -303,45 +364,18 @@ class VideoAnalysisService {
 
     cv.VideoCapture? cap;
     try {
-      // Optional hardware (MediaCodec) backend. Measured on a Pixel 9 with
-      // 4K portrait clips it was no faster than FFmpeg (both ~0.5x real
-      // time while the model runs) and its timestamps are not monotonic,
-      // so FFmpeg is the default.
-      bool hardware = false;
-      if (preferHardware && Platform.isAndroid) {
-        cap = cv.VideoCapture.fromFile(path, apiPreference: cv.CAP_ANDROID);
-        hardware = cap.isOpened;
-        if (!hardware) cap.release();
-      }
-      if (!hardware) {
-        cap = cv.VideoCapture.fromFile(path, apiPreference: cv.CAP_FFMPEG);
-        if (!cap.isOpened) {
-          cap.release();
-          cap = cv.VideoCapture.fromFile(path);
-        }
-      }
-      if (cap == null || !cap.isOpened) {
+      final opened = openForDecoding(path, preferHardware: preferHardware);
+      if (opened == null) {
         main.send(const VideoAnalysisError('Could not open video'));
         return;
       }
-      final bool ffmpeg = cap.getBackendName().toUpperCase().contains('FFMPEG');
-
-      final double fps = cap.get(cv.CAP_PROP_FPS);
+      cap = opened.cap;
+      final bool ffmpeg = !opened.hardware;
+      final double fps = opened.fps;
       final double frameMs = fps > 0 ? 1000.0 / fps : 1000.0 / 30.0;
-      final double frameCount = cap.get(cv.CAP_PROP_FRAME_COUNT);
-
-      // FFmpeg auto-rotates by the container's rotation tag. If the backend
-      // did not, rotate ourselves so frames match what the player shows.
-      final int meta = cap.get(cv.CAP_PROP_ORIENTATION_META).round() % 360;
-      final bool auto = cap.get(cv.CAP_PROP_ORIENTATION_AUTO) != 0;
-      int? rotateCode = auto
-          ? null
-          : switch (meta) {
-              90 => cv.ROTATE_90_CLOCKWISE,
-              180 => cv.ROTATE_180,
-              270 => cv.ROTATE_90_COUNTERCLOCKWISE,
-              _ => null,
-            };
+      final double frameCount = opened.frameCount;
+      final int meta = opened.meta;
+      int? rotateCode = opened.rotateCode;
 
       int lastTs = -1;
       int frameIndex = 0;
@@ -469,4 +503,27 @@ class VideoAnalysisService {
       control.close();
     }
   }
+}
+
+/// A video opened for decoding by [VideoAnalysisService.openForDecoding].
+class OpenedVideo {
+  final cv.VideoCapture cap;
+  final bool hardware;
+  final double fps;
+  final double frameCount;
+
+  /// Container rotation tag in degrees (0/90/180/270).
+  final int meta;
+
+  /// Rotation to apply to decoded frames (null: already upright).
+  final int? rotateCode;
+
+  const OpenedVideo(
+    this.cap,
+    this.hardware,
+    this.fps,
+    this.frameCount,
+    this.meta,
+    this.rotateCode,
+  );
 }
